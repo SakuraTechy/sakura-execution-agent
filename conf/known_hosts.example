@@ -1,0 +1,9 @@
+# 此文件仅展示 OpenSSH known_hosts 格式，不能作为真实环境的受信任主机文件。
+# 使用 scripts/update-known-hosts.ps1 获取候选指纹，完成带外核对后写入 conf/known_hosts。
+#
+# 默认端口示例：
+# 10.0.0.20 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA...
+#
+# 非默认端口示例：
+# [10.0.0.20]:2222 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA...
+

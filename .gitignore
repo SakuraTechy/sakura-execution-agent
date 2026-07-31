@@ -1,0 +1,10 @@
+/target/
+/drivers/target/
+/drivers/**/*.jar
+/drivers/driver-manifest.json
+/conf/known_hosts
+/conf/known_hosts.candidate
+/conf/known_hosts.old
+/conf/agent-token.clixml
+/conf/agent-token.machine
+/conf/agent-token.operator.clixml
