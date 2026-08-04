@@ -1,7 +1,11 @@
 package top.continew.sakura.agent;
 
+import java.awt.GraphicsEnvironment;
 import java.net.InetSocketAddress;
 import java.nio.file.Path;
+import java.util.LinkedHashSet;
+import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.Executors;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -43,7 +47,8 @@ public final class ExecutionAgentApplication {
         InfrastructureTaskService taskService = new InfrastructureTaskService(objectMapper, driverDirectory, logger,
             localActionPolicy);
         HttpServer server = HttpServer.create(new InetSocketAddress(bindAddress, port), 0);
-        server.createContext("/", new AgentHttpHandler(objectMapper, token, taskService, logger));
+        Map<String, Object> healthSnapshot = createHealthSnapshot(localActionPolicy);
+        server.createContext("/", new AgentHttpHandler(objectMapper, token, taskService, logger, healthSnapshot));
         server.setExecutor(Executors.newCachedThreadPool());
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             taskService.close();
@@ -54,5 +59,24 @@ public final class ExecutionAgentApplication {
             driverDirectory, localActionPolicy.workspaceRoot());
         logger.info("AGENT_STARTED", null, null, "reason=Agent启动完成 bind=" + bindAddress + ":" + port
             + " driverDirectory=" + driverDirectory + " workspaceConfigured=true logFile=" + logFile.toAbsolutePath().normalize());
+    }
+
+    private static Map<String, Object> createHealthSnapshot(LocalActionPolicy localActionPolicy) {
+        Set<String> agentTypes = new LinkedHashSet<>(Set.of("server", "runner-host"));
+        Set<String> features = new LinkedHashSet<>(Set.of("sftp", "host_command", "host_file", "host_file_delete"));
+        if (localActionPolicy.hasRuntimePropertyAllowlist()) {
+            features.add("runtime_property");
+        }
+        if (!GraphicsEnvironment.isHeadless()) {
+            agentTypes.add("desktop");
+            features.add("interactive_desktop");
+        }
+        if (localActionPolicy.hasCaptchaOcrConfiguration()) {
+            agentTypes.add("ocr");
+            features.add("screenshot");
+            features.add("ocr");
+        }
+        // 健康响应只发布能力标识，不返回 workspace、脚本路径或任何凭据。
+        return Map.of("status", "ok", "agent_types", Set.copyOf(agentTypes), "features", Set.copyOf(features));
     }
 }

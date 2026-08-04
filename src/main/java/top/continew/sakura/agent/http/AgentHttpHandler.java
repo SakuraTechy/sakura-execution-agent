@@ -23,15 +23,18 @@ public class AgentHttpHandler implements HttpHandler {
     private final String token;
     private final InfrastructureTaskService taskService;
     private final AgentLogger logger;
+    private final Map<String, Object> healthSnapshot;
 
     public AgentHttpHandler(ObjectMapper objectMapper,
                             String token,
                             InfrastructureTaskService taskService,
-                            AgentLogger logger) {
+                            AgentLogger logger,
+                            Map<String, Object> healthSnapshot) {
         this.objectMapper = objectMapper;
         this.token = token;
         this.taskService = taskService;
         this.logger = logger;
+        this.healthSnapshot = Map.copyOf(healthSnapshot);
     }
 
     @Override
@@ -46,7 +49,7 @@ public class AgentHttpHandler implements HttpHandler {
             logger.info("HTTP_RECEIVED", null, null, requestContext + " reason=收到HTTP请求");
             if ("/health".equals(path)) {
                 logger.info("HEALTH_CHECK", null, null, requestContext + " reason=健康检查");
-                respond(exchange, 200, Map.of("status", "ok"), null, null, requestId, "健康检查通过");
+                respond(exchange, 200, healthSnapshot, null, null, requestId, "健康检查通过");
                 return;
             }
             String authorizationFailureReason = authorizationFailureReason(exchange);

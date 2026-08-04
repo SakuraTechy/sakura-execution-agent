@@ -124,7 +124,8 @@ Set-Location D:\King\sakura\sakura-execution-agent
 .\scripts\install-agent.ps1 `
   -InstallRoot 'C:\ProgramData\Sakura\execution-agent' `
   -Profiles mysql,postgresql `
-  -KnownHostsPath .\conf\known_hosts
+  -KnownHostsPath '.\conf\known_hosts' `
+  -Port 19091
 ```
 
 正式安装会：

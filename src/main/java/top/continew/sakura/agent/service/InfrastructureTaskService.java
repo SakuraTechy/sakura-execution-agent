@@ -3,6 +3,7 @@ package top.continew.sakura.agent.service;
 import java.nio.file.Path;
 import java.time.Instant;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -17,6 +18,11 @@ import top.continew.sakura.agent.support.LocalActionPolicy;
 
 /** 任务幂等、异步执行和取消的唯一入口。 */
 public class InfrastructureTaskService implements AutoCloseable {
+
+    private static final Set<String> SUPPORTED_ACTIONS = Set.of("server_command", "database_sql", "database_native",
+        "host_command", "host_file_lookup", "host_file_delete", "global_variable_system_info",
+        "global_variable_available_ip", "global_variable_property", "captcha_ocr", "server_file_upload",
+        "host_pointer_move");
 
     private final ExecutorService executor = Executors.newCachedThreadPool();
     private final Map<String, TaskRuntime> tasks = new ConcurrentHashMap<>();
@@ -146,12 +152,7 @@ public class InfrastructureTaskService implements AutoCloseable {
         if (request.actionType() == null || request.actionType().isBlank()) {
             throw new IllegalArgumentException("actionType 不能为空");
         }
-        if (!Map.of("server_command", true, "database_sql", true, "database_native", true,
-            "host_command", true, "host_file_lookup", true, "host_file_delete", true,
-            "global_variable_system_info", true, "global_variable_available_ip", true,
-            "global_variable_property", true, "captcha_ocr", true, "server_file_upload", true,
-            "host_pointer_move", true)
-            .containsKey(request.actionType())) {
+        if (!SUPPORTED_ACTIONS.contains(request.actionType())) {
             throw new IllegalArgumentException("不支持的 actionType：" + request.actionType());
         }
     }

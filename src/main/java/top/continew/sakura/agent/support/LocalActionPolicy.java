@@ -56,6 +56,30 @@ public final class LocalActionPolicy {
         return allowedRoots;
     }
 
+    /** 只有部署显式配置了精确白名单，Agent 才对外声明运行时属性读取能力。 */
+    public boolean hasRuntimePropertyAllowlist() {
+        for (String configured : System.getProperty(RUNTIME_PROPERTY_ALLOWLIST, "").split("[,;]")) {
+            if (!configured.trim().isBlank()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** OCR 能力只有在解释器和安全目录内的脚本都已配置时才进入健康快照。 */
+    public boolean hasCaptchaOcrConfiguration() {
+        String python = System.getProperty("sakura.agent.captcha-ocr-python", "").trim();
+        String script = System.getProperty("sakura.agent.captcha-ocr-script", "").trim();
+        if (python.isBlank() || script.isBlank()) {
+            return false;
+        }
+        try {
+            return Files.isRegularFile(resolveExistingAllowedPath(script, "captcha_ocr 脚本"));
+        } catch (AgentExecutionException ignored) {
+            return false;
+        }
+    }
+
     /**
      * 运行时属性默认全部拒绝；部署时只能用 {@code profile:key} 或 {@code key} 精确列入白名单。
      * 禁止通配符，避免 JDBC 密码等敏感属性被“读取配置”步骤意外导出。

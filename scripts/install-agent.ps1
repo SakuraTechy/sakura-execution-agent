@@ -230,9 +230,12 @@ function Copy-WindowsPowerShellScript {
     [IO.File]::WriteAllText($Destination, $content, $utf8WithBom)
 }
 
-New-Item -ItemType Directory -Force $installPath, (Join-Path $installPath 'conf'), (Join-Path $installPath 'drivers'), (Join-Path $installPath 'logs') | Out-Null
+$workspacePath = Join-Path $installPath 'workspace'
+New-Item -ItemType Directory -Force $installPath, (Join-Path $installPath 'conf'), (Join-Path $installPath 'drivers'), (Join-Path $installPath 'logs'), $workspacePath | Out-Null
 Grant-DirectoryReadExecute -Path $installPath -SidValue 'S-1-5-19'
 Grant-DirectoryModify -Path (Join-Path $installPath 'logs') -SidValue 'S-1-5-19'
+# 计划任务默认工作目录是 System32，必须给 Agent 指定可写的专用 workspace。
+Grant-DirectoryModify -Path $workspacePath -SidValue 'S-1-5-19'
 Copy-Item -LiteralPath $agentJar -Destination (Join-Path $installPath 'sakura-execution-agent.jar') -Force
 Copy-Item -LiteralPath $knownHosts -Destination (Join-Path $installPath 'conf\known_hosts') -Force
 Copy-WindowsPowerShellScript -Source (Join-Path $PSScriptRoot 'run-installed-agent.ps1') -Destination (Join-Path $installPath 'run-agent.ps1')
@@ -297,6 +300,8 @@ if (-not $SkipTaskRegistration) {
     $taskPrincipal = New-ScheduledTaskPrincipal -UserId 'NT AUTHORITY\LOCAL SERVICE' -LogonType ServiceAccount
     $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit ([TimeSpan]::Zero)
     Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Principal $taskPrincipal -Settings $settings -Force | Out-Null
+    $bootstrapLogPath = Join-Path $installPath 'logs\bootstrap-error.log'
+    Remove-Item -LiteralPath $bootstrapLogPath -Force -ErrorAction SilentlyContinue
     Start-ScheduledTask -TaskName $TaskName
 
     $healthy = $false
@@ -313,12 +318,31 @@ if (-not $SkipTaskRegistration) {
         }
     }
     if (-not $healthy) {
-        throw "Agent 未在 20 秒内通过健康检查。请执行：Get-ScheduledTaskInfo -TaskName '$TaskName'"
+        $diagnostics = [System.Collections.Generic.List[string]]::new()
+        try {
+            $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction Stop
+            $taskInfo = Get-ScheduledTaskInfo -TaskName $TaskName -ErrorAction Stop
+            $resultUnsigned = [BitConverter]::ToUInt32([BitConverter]::GetBytes([int32]$taskInfo.LastTaskResult), 0)
+            $resultHex = '0x{0:X8}' -f $resultUnsigned
+            $diagnostics.Add("计划任务状态=$($task.State)，最近退出码=$resultHex（$($taskInfo.LastTaskResult)）")
+        } catch {
+            $diagnostics.Add("无法读取计划任务状态：$($_.Exception.Message)")
+        }
+        if (Test-Path -LiteralPath $bootstrapLogPath -PathType Leaf) {
+            $bootstrapErrors = @(Get-Content -LiteralPath $bootstrapLogPath -Tail 5)
+            if ($bootstrapErrors.Count -gt 0) {
+                $diagnostics.Add("启动日志=$($bootstrapErrors -join ' | ')")
+            }
+        } else {
+            $diagnostics.Add("未生成启动日志，计划任务可能尚未执行到 Agent 启动脚本")
+        }
+        throw "Agent 未在 20 秒内通过健康检查。$($diagnostics -join '；')"
     }
 }
 
-Remove-Variable agentToken,secureToken -ErrorAction SilentlyContinue
 Write-Host "Agent 安装完成：$installPath"
 Write-Host "Admin Token（CLIXML 格式）：$operatorTokenPath"
 Write-Host "Admin Token（当前操作账号 DPAPI）：$agentToken"
 Write-Host 'Admin 启动前通过 Import-Clixml 读取同一个 Token，不要重新生成。'
+
+Remove-Variable agentToken,secureToken -ErrorAction SilentlyContinue
