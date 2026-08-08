@@ -13,7 +13,9 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpHandler;
 import top.continew.sakura.agent.model.InfrastructureTaskRequest;
+import top.continew.sakura.agent.service.InfrastructureArtifactStore;
 import top.continew.sakura.agent.service.InfrastructureTaskService;
+import top.continew.sakura.agent.support.AgentRequestException;
 import top.continew.sakura.agent.support.AgentLogger;
 
 /** 本机 HTTP 边界：认证、JSON 解码和任务路由全部在这里收敛。 */
@@ -72,7 +74,21 @@ public class AgentHttpHandler implements HttpHandler {
                 return;
             }
             if (path.startsWith("/v1/tasks/")) {
-                String taskId = path.substring("/v1/tasks/".length());
+                String taskPath = path.substring("/v1/tasks/".length());
+                if ("GET".equals(method) && taskPath.endsWith("/artifact")) {
+                    String taskId = taskPath.substring(0, taskPath.length() - "/artifact".length());
+                    if (taskId.isBlank() || taskId.contains("/")) {
+                        respond(exchange, 404, Map.of("error", "TASK_NOT_FOUND"), null, null, requestId,
+                            "附件路径中的taskId为空或包含非法斜杠");
+                        return;
+                    }
+                    InfrastructureArtifactStore.ArtifactContent artifact = taskService.getArtifact(taskId);
+                    writeArtifact(exchange, artifact);
+                    logger.info("HTTP_RESPONSE", taskId, null, "requestId=" + requestId
+                        + " status=200 reason=基础设施结果附件下载成功 sizeBytes=" + artifact.bytes().length);
+                    return;
+                }
+                String taskId = taskPath;
                 if (taskId.isBlank() || taskId.contains("/")) {
                     respond(exchange, 404, Map.of("error", "TASK_NOT_FOUND"), null, null, requestId,
                         "任务路径中的taskId为空或包含非法斜杠");
@@ -91,6 +107,10 @@ public class AgentHttpHandler implements HttpHandler {
             }
             respond(exchange, 404, Map.of("error", "NOT_FOUND"), null, null, requestId,
                 "请求方法或路径不支持");
+        } catch (AgentRequestException e) {
+            logger.warn(e.errorCode(), null, null, requestContext + " reason=" + e.getMessage());
+            respond(exchange, 409, Map.of("error", e.errorCode(), "message", e.getMessage()), null, null, requestId,
+                "任务请求与持久化账本冲突");
         } catch (IllegalArgumentException e) {
             String invalidMessage = e.getMessage() == null || e.getMessage().isBlank() ? "请求参数非法" : e.getMessage();
             logger.warn("INVALID_REQUEST", null, null, requestContext + " reason=请求参数或任务参数校验失败 exception="
@@ -132,6 +152,17 @@ public class AgentHttpHandler implements HttpHandler {
         exchange.sendResponseHeaders(status, bytes.length);
         try (OutputStream output = exchange.getResponseBody()) {
             output.write(bytes);
+        }
+    }
+
+    private void writeArtifact(HttpExchange exchange,
+                               InfrastructureArtifactStore.ArtifactContent artifact) throws IOException {
+        exchange.getResponseHeaders().set("Content-Type", artifact.contentType());
+        exchange.getResponseHeaders().set("Content-Disposition", "attachment; filename=\"" + artifact.fileName() + "\"");
+        exchange.getResponseHeaders().set("X-Content-Sha256", artifact.sha256());
+        exchange.sendResponseHeaders(200, artifact.bytes().length);
+        try (OutputStream output = exchange.getResponseBody()) {
+            output.write(artifact.bytes());
         }
     }
 

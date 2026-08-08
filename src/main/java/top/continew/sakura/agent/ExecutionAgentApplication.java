@@ -38,6 +38,7 @@ public final class ExecutionAgentApplication {
             .toAbsolutePath()
             .normalize();
         Path logFile = Path.of(System.getProperty("sakura.agent.log-file", "logs/agent.log"));
+        Path ledgerFile = Path.of(System.getProperty("sakura.agent.ledger-file", "data/task-ledger.json"));
         // 任务状态中使用 Instant，必须以 ISO-8601 写入 JSON；否则状态轮询会因序列化失败反复返回 500。
         ObjectMapper objectMapper = new ObjectMapper()
             .registerModule(new JavaTimeModule())
@@ -45,7 +46,7 @@ public final class ExecutionAgentApplication {
         AgentLogger logger = new AgentLogger(logFile);
         LocalActionPolicy localActionPolicy = LocalActionPolicy.fromSystemProperties();
         InfrastructureTaskService taskService = new InfrastructureTaskService(objectMapper, driverDirectory, logger,
-            localActionPolicy);
+            localActionPolicy, ledgerFile);
         HttpServer server = HttpServer.create(new InetSocketAddress(bindAddress, port), 0);
         Map<String, Object> healthSnapshot = createHealthSnapshot(localActionPolicy);
         server.createContext("/", new AgentHttpHandler(objectMapper, token, taskService, logger, healthSnapshot));

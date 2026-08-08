@@ -47,7 +47,11 @@ public record InfrastructureTaskRequest(@JsonAlias({"task_id"}) String taskId,
                                         String capability,
                                         List<String> capabilities,
                                         @JsonAlias({"approval_granted", "approved"}) Boolean approvalGranted,
-                                        @JsonAlias({"approval_id"}) String approvalId) {
+                                        @JsonAlias({"approval_id"}) String approvalId,
+                                        @JsonAlias({"risk_level"}) String riskLevel,
+                                        @JsonAlias({"read_only_enforced"}) Boolean readOnlyEnforced,
+                                        @JsonAlias({"command_template_id"}) String commandTemplateId,
+                                        @JsonAlias({"approval_digest"}) String approvalDigest) {
 
     public record SshTarget(String host,
                             Integer port,
@@ -64,7 +68,16 @@ public record InfrastructureTaskRequest(@JsonAlias({"task_id"}) String taskId,
                              String password) {
     }
 
-    public record JdbcParameter(String jdbcType, Object value) {
+    public record JdbcParameter(String name,
+                                Integer position,
+                                String jdbcType,
+                                String typeName,
+                                String direction,
+                                Object value) {
+
+        public JdbcParameter(String jdbcType, Object value) {
+            this(null, null, jdbcType, null, "IN", value);
+        }
     }
 
     public record MongoTarget(String connectionString, String database) {

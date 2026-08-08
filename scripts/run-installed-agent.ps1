@@ -36,6 +36,8 @@ $knownHostsPath = Join-Path $installPath 'conf\known_hosts'
 $logDirectory = Join-Path $installPath 'logs'
 $logPath = Join-Path $logDirectory 'agent.log'
 $workspacePath = Join-Path $installPath 'workspace'
+# 任务账本必须放在 LOCAL SERVICE 可写的专用 workspace，安装根目录只读。
+$ledgerPath = Join-Path $workspacePath 'task-ledger.json'
 
 foreach ($requiredPath in @($tokenPath, $jarPath, $driversPath, $knownHostsPath, $workspacePath)) {
     if (-not (Test-Path -LiteralPath $requiredPath)) {
@@ -77,6 +79,7 @@ try {
         "-Dsakura.agent.known-hosts=$knownHostsPath" `
         "-Dsakura.agent.log-file=$logPath" `
         "-Dsakura.agent.workspace=$workspacePath" `
+        "-Dsakura.agent.ledger-file=$ledgerPath" `
         -jar $jarPath 2>> $bootstrapLogPath
     $javaExitCode = $LASTEXITCODE
     if ($javaExitCode -ne 0) {

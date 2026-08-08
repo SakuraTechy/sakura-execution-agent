@@ -111,8 +111,8 @@ class InfrastructureTaskExecutorLocalActionTest {
 
         InfrastructureTaskExecutor.ExecutionOutcome deleted = executor.execute(request(Map.of("taskId", "delete-ok",
             "actionType", "host_file_delete", "filePath", file.toString(), "capability", "host_file_delete",
-            "approvalGranted", true, "approvalId", "approval-1")));
-        assertEquals(1, deleted.result().get("deleted_count"));
+            "approvalGranted", true, "approvalId", "approval-1", "approvalDigest", "a".repeat(64))));
+        assertEquals(1L, deleted.result().get("deleted_count"));
         assertFalse(Files.exists(file));
     }
 

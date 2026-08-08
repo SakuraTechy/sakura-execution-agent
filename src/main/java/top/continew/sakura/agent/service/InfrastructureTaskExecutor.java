@@ -37,12 +37,14 @@ import java.nio.file.attribute.FileTime;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.sql.Connection;
+import java.sql.CallableStatement;
 import java.sql.Driver;
 import java.sql.JDBCType;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.ResultSetMetaData;
 import java.sql.SQLException;
+import java.sql.SQLWarning;
 import java.sql.Statement;
 import java.time.Duration;
 import java.time.Instant;
@@ -70,8 +72,10 @@ import top.continew.sakura.agent.support.LocalActionPolicy;
  */
 public class InfrastructureTaskExecutor {
 
-    private static final int MAX_OUTPUT_BYTES = 256 * 1024;
+    private static final int MAX_OUTPUT_BYTES = 4 * 1024 * 1024;
     private static final int DEFAULT_MAX_ROWS = 200;
+    private static final int MAX_PREVIEW_ROWS = 200;
+    private static final int MAX_ATTACHMENT_ROWS = 10_000;
     private static final int DEFAULT_MAX_FILE_RESULTS = 200;
     private static final int MAX_FILE_RESULTS = 1_000;
     private static final int DEFAULT_MAX_IP_PROBES = 64;
@@ -240,7 +244,7 @@ public class InfrastructureTaskExecutor {
         logger.info("JDBC_TARGET_VALIDATED", request.taskId(), request.actionType(), "driverProfile=" + target.driverProfile()
             + " driverClass=" + target.driverClass() + " sqlMode=" + normalizeSqlMode(request.sqlMode()) + " parameterCount="
             + (request.parameters() == null ? 0 : request.parameters().size()) + " timeoutMs=" + timeoutMillis(request.timeoutMs())
-            + " maxRows=" + Math.max(1, request.maxRows() == 0 ? DEFAULT_MAX_ROWS : request.maxRows()) + " "
+            + " maxRows=" + rowLimit(request.maxRows()) + " "
             + jdbcConnectionDiagnostic(target) + " sqlFingerprint=" + fingerprint(request.sql()) + " sqlLength="
             + request.sql().length() + " parameterTypes=" + parameterTypes(request.parameters()));
         Driver driver = loadDriver(request);
@@ -257,24 +261,45 @@ public class InfrastructureTaskExecutor {
             }
             logger.info("JDBC_CONNECTION_OPENED", request.taskId(), request.actionType(), "driver=" + connection.getMetaData()
                 .getDriverName() + " driverVersion=" + connection.getMetaData().getDriverVersion());
-            try (PreparedStatement statement = connection.prepareStatement(request.sql())) {
-                cancelActions.put(request.taskId(), () -> cancelStatement(statement, connection));
-                statement.setQueryTimeout(queryTimeoutSeconds(request.timeoutMs()));
-                statement.setMaxRows(Math.max(1, request.maxRows() == 0 ? DEFAULT_MAX_ROWS : request.maxRows()));
-                bindParameters(statement, request.parameters());
-                logger.info("JDBC_STATEMENT_PREPARED", request.taskId(), request.actionType(), "queryTimeoutSeconds="
-                    + queryTimeoutSeconds(request.timeoutMs()));
-                ExecutionOutcome outcome = switch (normalizeSqlMode(request.sqlMode())) {
-                    case "query" -> executeQuery(statement, startedAt, request.maxRows());
-                    case "update" -> outcome(startedAt, 0, statement.executeUpdate(), null, "", "");
-                    case "call" -> executeCall(statement, startedAt, request.maxRows());
-                    default -> throw new IllegalArgumentException("不支持的 sqlMode：" + request.sqlMode());
-                };
-                outcome = bindQueryResultIfRequested(request, outcome);
-                logger.info("JDBC_STATEMENT_COMPLETED", request.taskId(), request.actionType(), "durationMs=" + outcome
-                    .durationMs() + " affectedRows=" + outcome.affectedRows() + " rowCount=" + (outcome.rows() == null ? 0
-                        : outcome.rows().size()));
-                return outcome;
+            String sqlMode = normalizeSqlMode(request.sqlMode());
+            boolean readOnlyTransaction = "query".equals(sqlMode);
+            if (readOnlyTransaction) {
+                if (!Boolean.TRUE.equals(request.readOnlyEnforced())) {
+                    throw new AgentExecutionException("JDBC_READ_ONLY_REQUIRED", "query 模式必须由 Admin 强制只读事务");
+                }
+                // 只读事务是数据库侧安全边界；驱动不支持时明确失败，不能降级为普通连接继续查询。
+                connection.setReadOnly(true);
+                connection.setAutoCommit(false);
+            }
+            try {
+                try (PreparedStatement statement = "call".equals(sqlMode)
+                    ? connection.prepareCall(request.sql())
+                    : connection.prepareStatement(request.sql())) {
+                    cancelActions.put(request.taskId(), () -> cancelStatement(statement, connection));
+                    statement.setQueryTimeout(queryTimeoutSeconds(request.timeoutMs()));
+                    // 多取一行才能可靠标记预览截断；返回给调用方时仍严格限制在 maxRows。
+                    statement.setMaxRows(MAX_ATTACHMENT_ROWS + 1);
+                    bindParameters(statement, request.parameters());
+                    if (statement instanceof CallableStatement callableStatement) {
+                        registerOutParameters(callableStatement, request.parameters());
+                    }
+                    logger.info("JDBC_STATEMENT_PREPARED", request.taskId(), request.actionType(), "queryTimeoutSeconds="
+                        + queryTimeoutSeconds(request.timeoutMs()));
+                    ExecutionOutcome outcome = switch (sqlMode) {
+                        case "query" -> executeQuery(statement, startedAt, request.maxRows());
+                        case "update" -> outcome(startedAt, 0, statement.executeLargeUpdate(), null, "", "");
+                        case "call" -> executeCall((CallableStatement)statement, request.parameters(), startedAt, request
+                            .maxRows());
+                        default -> throw new IllegalArgumentException("不支持的 sqlMode：" + request.sqlMode());
+                    };
+                    outcome = bindQueryResultIfRequested(request, outcome);
+                    logger.info("JDBC_STATEMENT_COMPLETED", request.taskId(), request.actionType(), "durationMs=" + outcome
+                        .durationMs() + " affectedRows=" + outcome.affectedRows() + " rowCount=" + (outcome.rows() == null ? 0
+                            : outcome.rows().size()));
+                    return outcome;
+                }
+            } finally {
+                if (readOnlyTransaction) connection.rollback();
             }
         } finally {
             if (driver instanceof IsolatedDriver isolatedDriver) {
@@ -293,7 +318,8 @@ public class InfrastructureTaskExecutor {
         }
         String variableName = validateVariableName(request.variableName());
         return new ExecutionOutcome(outcome.durationMs(), outcome.exitCode(), outcome.affectedRows(), outcome.rows(),
-            outcome.stdout(), outcome.stderr(), Map.of("variables", Map.of(variableName, outcome.rows())));
+            outcome.stdout(), outcome.stderr(), Map.of("variables", Map.of(variableName, outcome.rows())), outcome
+                .results(), outcome.warnings(), outcome.truncated(), outcome.artifactResult());
     }
 
     private ExecutionOutcome executeMongo(InfrastructureTaskRequest request, Instant startedAt) {
@@ -302,8 +328,8 @@ public class InfrastructureTaskExecutor {
             throw new IllegalArgumentException("MongoDB 原生操作缺少连接、数据库或集合");
         }
         logger.info("MONGO_TARGET_VALIDATED", request.taskId(), request.actionType(), "operation=" + normalizeMongoOperation(
-            request.mongoOperation()) + " collection=" + request.collection() + " maxRows=" + Math.max(1, request.maxRows()
-                == 0 ? DEFAULT_MAX_ROWS : request.maxRows()) + " " + mongoConnectionDiagnostic(request.mongoTarget()));
+            request.mongoOperation()) + " collection=" + request.collection() + " maxRows=" + rowLimit(request.maxRows())
+            + " " + mongoConnectionDiagnostic(request.mongoTarget()));
         try (MongoClient client = MongoClients.create(request.mongoTarget().connectionString())) {
             cancelActions.put(request.taskId(), client::close);
             MongoDatabase database = client.getDatabase(request.mongoTarget().database());
@@ -313,16 +339,23 @@ public class InfrastructureTaskExecutor {
             ExecutionOutcome outcome = switch (normalizeMongoOperation(request.mongoOperation())) {
                 case "find" -> mongoFind(collection, filter, startedAt, request.maxRows());
                 case "insert" -> {
-                    collection.insertOne(document);
-                    yield outcome(startedAt, 0, 1, null, "", "");
+                    var insertResult = collection.insertOne(document);
+                    Map<String, Object> details = new LinkedHashMap<>();
+                    details.put("acknowledged", insertResult.wasAcknowledged());
+                    details.put("insertedId", insertResult.getInsertedId() == null ? null : String.valueOf(insertResult
+                        .getInsertedId()));
+                    yield nativeMutationOutcome(startedAt, "insert", 1L, details);
                 }
                 case "update" -> {
-                    long matched = collection.updateMany(filter, document).getModifiedCount();
-                    yield outcome(startedAt, 0, Math.toIntExact(matched), null, "", "");
+                    var updateResult = collection.updateMany(filter, document);
+                    Map<String, Object> details = new LinkedHashMap<>();
+                    details.put("matchedCount", updateResult.getMatchedCount());
+                    details.put("modifiedCount", updateResult.getModifiedCount());
+                    yield nativeMutationOutcome(startedAt, "update", updateResult.getModifiedCount(), details);
                 }
                 case "delete" -> {
                     long deleted = collection.deleteMany(filter).getDeletedCount();
-                    yield outcome(startedAt, 0, Math.toIntExact(deleted), null, "", "");
+                    yield nativeMutationOutcome(startedAt, "delete", deleted, Map.of("deletedCount", deleted));
                 }
                 default -> throw new IllegalArgumentException("不支持的 MongoDB 操作：" + request.mongoOperation());
             };
@@ -437,7 +470,7 @@ public class InfrastructureTaskExecutor {
     private ExecutionOutcome executeHostFileDelete(InfrastructureTaskRequest request, Instant startedAt) throws Exception {
         requireCapability(request, "host_file_delete", true);
         Path target = localActionPolicy.resolveExistingAllowedPath(request.filePath(), "host_file_delete");
-        int deletedCount;
+        long deletedCount;
         try {
             if (Files.isDirectory(target, LinkOption.NOFOLLOW_LINKS)) {
                 if (!Boolean.TRUE.equals(request.recursive())) {
@@ -715,7 +748,8 @@ public class InfrastructureTaskExecutor {
     }
 
     private void requireApproval(InfrastructureTaskRequest request, String actionType) throws AgentExecutionException {
-        if (!Boolean.TRUE.equals(request.approvalGranted()) || isBlank(request.approvalId())) {
+        if (!Boolean.TRUE.equals(request.approvalGranted()) || isBlank(request.approvalId())
+            || isBlank(request.approvalDigest()) || !request.approvalDigest().matches("[0-9a-fA-F]{64}")) {
             throw new AgentExecutionException("HOST_ACTION_APPROVAL_REQUIRED", actionType + " 需要有效审批声明");
         }
     }
@@ -1043,25 +1077,86 @@ public class InfrastructureTaskExecutor {
 
     private ExecutionOutcome executeQuery(PreparedStatement statement, Instant startedAt, int maxRows) throws SQLException {
         try (ResultSet resultSet = statement.executeQuery()) {
-            return outcome(startedAt, 0, null, readRows(resultSet, maxRows), "", "");
+            ResultSetPreview preview = readResultSet(resultSet, maxRows);
+            return structuredOutcome(startedAt, 0, null, preview.legacyRows(), "", "", Map.of(), List
+                .of(preview.result()), sqlWarnings(statement.getWarnings()), preview.truncated(), preview.artifactResult());
         }
     }
 
-    private ExecutionOutcome executeCall(PreparedStatement statement, Instant startedAt, int maxRows) throws SQLException {
+    private ExecutionOutcome executeCall(CallableStatement statement,
+                                         List<InfrastructureTaskRequest.JdbcParameter> parameters,
+                                         Instant startedAt,
+                                         int maxRows) throws SQLException {
+        List<Map<String, Object>> results = new ArrayList<>();
+        List<Map<String, Object>> artifactResults = new ArrayList<>();
+        List<Map<String, Object>> firstRows = null;
+        Long affectedRows = null;
+        boolean truncated = false;
         boolean hasResultSet = statement.execute();
-        if (!hasResultSet) {
-            return outcome(startedAt, 0, statement.getUpdateCount(), null, "", "");
+        while (true) {
+            if (hasResultSet) {
+                try (ResultSet resultSet = statement.getResultSet()) {
+                    ResultSetPreview preview = readResultSet(resultSet, maxRows);
+                    results.add(preview.result());
+                    artifactResults.add(preview.artifactResult());
+                    if (firstRows == null) firstRows = preview.legacyRows();
+                    truncated |= preview.truncated();
+                }
+            } else {
+                long updateCount = statement.getLargeUpdateCount();
+                if (updateCount == -1L) break;
+                Map<String, Object> updateResult = updateCountResult(updateCount);
+                results.add(updateResult);
+                artifactResults.add(updateResult);
+                affectedRows = affectedRows == null ? updateCount : Math.addExact(affectedRows, updateCount);
+            }
+            hasResultSet = statement.getMoreResults(Statement.CLOSE_CURRENT_RESULT);
         }
-        try (ResultSet resultSet = statement.getResultSet()) {
-            return outcome(startedAt, 0, null, readRows(resultSet, maxRows), "", "");
+        Map<String, Object> outParameters = outParametersResult(statement, parameters);
+        if (!outParameters.isEmpty()) {
+            results.add(outParameters);
+            artifactResults.add(outParameters);
         }
+        Map<String, Object> artifact = new LinkedHashMap<>();
+        artifact.put("type", "MULTI_RESULT");
+        artifact.put("results", artifactResults);
+        artifact.put("truncated", truncated);
+        return structuredOutcome(startedAt, 0, affectedRows, firstRows, "", "", Map.of(), results, sqlWarnings(statement
+            .getWarnings()), truncated, artifact);
     }
 
     private ExecutionOutcome mongoFind(MongoCollection<Document> collection, Document filter, Instant startedAt, int maxRows) {
-        int limit = Math.max(1, maxRows == 0 ? DEFAULT_MAX_ROWS : maxRows);
-        List<Map<String, Object>> rows = collection.find(filter).limit(limit).map(document ->
+        int previewLimit = rowLimit(maxRows);
+        List<Map<String, Object>> fetched = collection.find(filter).limit(MAX_ATTACHMENT_ROWS + 1).map(document ->
             objectMapper.convertValue(document, new TypeReference<Map<String, Object>>() { })).into(new ArrayList<>());
-        return outcome(startedAt, 0, null, rows, "", "");
+        boolean attachmentTruncated = fetched.size() > MAX_ATTACHMENT_ROWS;
+        List<Map<String, Object>> attachmentRows = fetched.stream().limit(MAX_ATTACHMENT_ROWS).toList();
+        boolean previewTruncated = attachmentRows.size() > previewLimit || attachmentTruncated;
+        List<Map<String, Object>> rows = attachmentRows.stream().limit(previewLimit).toList();
+        Map<String, Object> nativeResult = new LinkedHashMap<>();
+        nativeResult.put("type", "NATIVE_RESULT");
+        nativeResult.put("value", rows);
+        nativeResult.put("rowCount", (long)rows.size());
+        nativeResult.put("truncated", previewTruncated);
+        Map<String, Object> artifactResult = new LinkedHashMap<>();
+        artifactResult.put("type", "NATIVE_RESULT");
+        artifactResult.put("value", attachmentRows);
+        artifactResult.put("rowCount", (long)attachmentRows.size());
+        artifactResult.put("truncated", attachmentTruncated);
+        return structuredOutcome(startedAt, 0, null, rows, "", "", Map.of(), List.of(nativeResult), List.of(),
+            previewTruncated, artifactResult);
+    }
+
+    private ExecutionOutcome nativeMutationOutcome(Instant startedAt,
+                                                    String operation,
+                                                    long affectedRows,
+                                                    Map<String, Object> value) {
+        Map<String, Object> nativeResult = new LinkedHashMap<>();
+        nativeResult.put("type", "NATIVE_RESULT");
+        nativeResult.put("operation", operation);
+        nativeResult.put("value", value);
+        return structuredOutcome(startedAt, 0, affectedRows, null, "", "", Map.of(), List.of(nativeResult), List.of(),
+            false);
     }
 
     private Driver loadDriver(InfrastructureTaskRequest request) throws Exception {
@@ -1112,38 +1207,178 @@ public class InfrastructureTaskExecutor {
         }
         for (int index = 0; index < parameters.size(); index++) {
             InfrastructureTaskRequest.JdbcParameter parameter = parameters.get(index);
-            if (parameter == null || parameter.value() == null) {
-                statement.setObject(index + 1, null);
+            if (parameter == null || "OUT".equals(parameterDirection(parameter))) {
+                continue;
+            }
+            int position = parameterPosition(parameter, index);
+            if (parameter.value() == null) {
+                if (isBlank(parameter.jdbcType())) {
+                    statement.setObject(position, null);
+                } else {
+                    statement.setNull(position, jdbcType(parameter).getVendorTypeNumber());
+                }
                 continue;
             }
             if (isBlank(parameter.jdbcType())) {
-                statement.setObject(index + 1, parameter.value());
+                statement.setObject(position, parameter.value());
                 continue;
             }
-            statement.setObject(index + 1, parameter.value(), JDBCType.valueOf(parameter.jdbcType().toUpperCase(Locale.ROOT)));
+            statement.setObject(position, parameter.value(), jdbcType(parameter));
         }
     }
 
-    private List<Map<String, Object>> readRows(ResultSet resultSet, int requestedMaxRows) throws SQLException {
-        int limit = Math.max(1, requestedMaxRows == 0 ? DEFAULT_MAX_ROWS : requestedMaxRows);
-        ResultSetMetaData metadata = resultSet.getMetaData();
-        List<Map<String, Object>> rows = new ArrayList<>();
-        while (resultSet.next() && rows.size() < limit) {
-            Map<String, Object> row = new java.util.LinkedHashMap<>();
-            for (int column = 1; column <= metadata.getColumnCount(); column++) {
-                row.put(metadata.getColumnLabel(column), normalizeValue(resultSet.getObject(column)));
+    private void registerOutParameters(CallableStatement statement,
+                                       List<InfrastructureTaskRequest.JdbcParameter> parameters) throws SQLException {
+        if (parameters == null) return;
+        for (int index = 0; index < parameters.size(); index++) {
+            InfrastructureTaskRequest.JdbcParameter parameter = parameters.get(index);
+            if (parameter == null || "IN".equals(parameterDirection(parameter))) continue;
+            if (isBlank(parameter.jdbcType())) {
+                throw new SQLException("OUT/INOUT 参数必须声明 jdbcType");
             }
-            rows.add(row);
+            statement.registerOutParameter(parameterPosition(parameter, index), jdbcType(parameter).getVendorTypeNumber());
         }
-        return rows;
+    }
+
+    private int parameterPosition(InfrastructureTaskRequest.JdbcParameter parameter, int zeroBasedIndex) {
+        return parameter.position() == null || parameter.position() <= 0 ? zeroBasedIndex + 1 : parameter.position();
+    }
+
+    private String parameterDirection(InfrastructureTaskRequest.JdbcParameter parameter) {
+        String value = isBlank(parameter.direction()) ? "IN" : parameter.direction().trim().toUpperCase(Locale.ROOT);
+        if (!Set.of("IN", "OUT", "INOUT").contains(value)) {
+            throw new IllegalArgumentException("不支持的 JDBC 参数方向：" + parameter.direction());
+        }
+        return value;
+    }
+
+    private JDBCType jdbcType(InfrastructureTaskRequest.JdbcParameter parameter) {
+        try {
+            return JDBCType.valueOf(parameter.jdbcType().trim().toUpperCase(Locale.ROOT));
+        } catch (IllegalArgumentException exception) {
+            throw new IllegalArgumentException("不支持的 JDBC 类型：" + parameter.jdbcType(), exception);
+        }
+    }
+
+    private ResultSetPreview readResultSet(ResultSet resultSet, int requestedMaxRows) throws SQLException {
+        int limit = rowLimit(requestedMaxRows);
+        ResultSetMetaData metadata = resultSet.getMetaData();
+        List<Map<String, Object>> columns = new ArrayList<>();
+        List<String> legacyKeys = new ArrayList<>();
+        Set<String> usedLegacyKeys = new java.util.LinkedHashSet<>();
+        for (int column = 1; column <= metadata.getColumnCount(); column++) {
+            String name = metadata.getColumnName(column);
+            String label = metadata.getColumnLabel(column);
+            Map<String, Object> columnMetadata = new LinkedHashMap<>();
+            columnMetadata.put("name", name);
+            columnMetadata.put("label", label);
+            columnMetadata.put("jdbcType", metadata.getColumnType(column));
+            columnMetadata.put("typeName", metadata.getColumnTypeName(column));
+            columnMetadata.put("nullable", metadata.isNullable(column) != ResultSetMetaData.columnNoNulls);
+            columns.add(columnMetadata);
+            String baseKey = !isBlank(label) ? label : !isBlank(name) ? name : "column_" + column;
+            String uniqueKey = baseKey;
+            int duplicateIndex = 2;
+            while (!usedLegacyKeys.add(uniqueKey)) uniqueKey = baseKey + "#" + duplicateIndex++;
+            legacyKeys.add(uniqueKey);
+        }
+        List<Map<String, Object>> allLegacyRows = new ArrayList<>();
+        List<List<Object>> allOrderedRows = new ArrayList<>();
+        boolean attachmentTruncated = false;
+        while (resultSet.next()) {
+            if (allOrderedRows.size() >= MAX_ATTACHMENT_ROWS) {
+                attachmentTruncated = true;
+                break;
+            }
+            Map<String, Object> legacyRow = new LinkedHashMap<>();
+            List<Object> orderedRow = new ArrayList<>();
+            for (int column = 1; column <= metadata.getColumnCount(); column++) {
+                Object value = normalizeValue(resultSet.getObject(column));
+                orderedRow.add(value);
+                // 旧变量投影使用稳定唯一键；v2 始终使用有序数组，重复 label 不会覆盖。
+                legacyRow.put(legacyKeys.get(column - 1), value);
+            }
+            allLegacyRows.add(legacyRow);
+            allOrderedRows.add(orderedRow);
+        }
+        boolean previewTruncated = allOrderedRows.size() > limit || attachmentTruncated;
+        List<Map<String, Object>> legacyRows = allLegacyRows.stream().limit(limit).toList();
+        List<List<Object>> orderedRows = allOrderedRows.stream().limit(limit).toList();
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("type", "ROW_SET");
+        result.put("columns", columns);
+        result.put("rows", orderedRows);
+        result.put("rowCount", (long)orderedRows.size());
+        result.put("truncated", previewTruncated);
+        Map<String, Object> artifactResult = new LinkedHashMap<>();
+        artifactResult.put("type", "ROW_SET");
+        artifactResult.put("columns", columns);
+        artifactResult.put("rows", allOrderedRows);
+        artifactResult.put("rowCount", (long)allOrderedRows.size());
+        artifactResult.put("truncated", attachmentTruncated);
+        return new ResultSetPreview(result, legacyRows, previewTruncated, artifactResult);
+    }
+
+    private Map<String, Object> updateCountResult(long affectedRows) {
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("type", "UPDATE_COUNT");
+        result.put("affectedRows", affectedRows);
+        return result;
+    }
+
+    private Map<String, Object> outParametersResult(CallableStatement statement,
+                                                    List<InfrastructureTaskRequest.JdbcParameter> parameters)
+        throws SQLException {
+        if (parameters == null || parameters.isEmpty()) return Map.of();
+        List<Map<String, Object>> values = new ArrayList<>();
+        for (int index = 0; index < parameters.size(); index++) {
+            InfrastructureTaskRequest.JdbcParameter parameter = parameters.get(index);
+            if (parameter == null || "IN".equals(parameterDirection(parameter))) continue;
+            int position = parameterPosition(parameter, index);
+            JDBCType jdbcType = jdbcType(parameter);
+            Map<String, Object> value = new LinkedHashMap<>();
+            value.put("name", parameter.name());
+            value.put("position", position);
+            value.put("jdbcType", jdbcType.getVendorTypeNumber());
+            value.put("typeName", isBlank(parameter.typeName()) ? jdbcType.getName() : parameter.typeName());
+            value.put("value", normalizeValue(statement.getObject(position)));
+            values.add(value);
+        }
+        if (values.isEmpty()) return Map.of();
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("type", "OUT_PARAMETERS");
+        result.put("parameters", values);
+        return result;
+    }
+
+    private List<String> sqlWarnings(SQLWarning warning) {
+        if (warning == null) return List.of();
+        List<String> warnings = new ArrayList<>();
+        SQLWarning current = warning;
+        while (current != null && warnings.size() < 100) {
+            String message = current.getMessage();
+            warnings.add(message == null ? current.getSQLState() : message);
+            current = current.getNextWarning();
+        }
+        return List.copyOf(warnings);
+    }
+
+    private int rowLimit(int requestedMaxRows) {
+        return Math.min(MAX_PREVIEW_ROWS, Math.max(1, requestedMaxRows == 0 ? DEFAULT_MAX_ROWS : requestedMaxRows));
     }
 
     private Object normalizeValue(Object value) {
         if (value instanceof byte[] bytes) {
-            return "<binary:" + bytes.length + " bytes>";
+            return Map.of("type", "BINARY", "sizeBytes", (long)bytes.length, "inline", false);
+        }
+        if (value instanceof java.sql.Date || value instanceof java.sql.Time || value instanceof java.sql.Timestamp
+            || value instanceof java.time.temporal.TemporalAccessor) return String.valueOf(value);
+        if (value == null || value instanceof Number || value instanceof Boolean || value instanceof String) {
+            String rendered = String.valueOf(value);
+            return rendered.length() > 4096 ? rendered.substring(0, 4096) + "…" : value;
         }
         String rendered = String.valueOf(value);
-        return rendered.length() > 4096 ? rendered.substring(0, 4096) + "…" : value;
+        return rendered.length() > 4096 ? rendered.substring(0, 4096) + "…" : rendered;
     }
 
     private Document asDocument(Map<String, Object> values) {
@@ -1188,17 +1423,57 @@ public class InfrastructureTaskExecutor {
         }
     }
 
-    private ExecutionOutcome outcome(Instant startedAt, int exitCode, Integer affectedRows,
+    private ExecutionOutcome outcome(Instant startedAt, int exitCode, Long affectedRows,
                                      List<Map<String, Object>> rows, String stdout, String stderr) {
         return outcome(startedAt, exitCode, affectedRows, rows, stdout, stderr, Map.of());
     }
 
-    private ExecutionOutcome outcome(Instant startedAt, int exitCode, Integer affectedRows,
+    private ExecutionOutcome outcome(Instant startedAt, int exitCode, Long affectedRows,
                                      List<Map<String, Object>> rows, String stdout, String stderr,
                                      Map<String, Object> result) {
+        List<Map<String, Object>> results = new ArrayList<>();
+        if (rows != null) {
+            Map<String, Object> nativeResult = new LinkedHashMap<>();
+            nativeResult.put("type", "NATIVE_RESULT");
+            nativeResult.put("value", rows);
+            nativeResult.put("rowCount", (long)rows.size());
+            nativeResult.put("truncated", false);
+            results.add(nativeResult);
+        }
+        if (affectedRows != null) results.add(updateCountResult(affectedRows));
+        return structuredOutcome(startedAt, exitCode, affectedRows, rows, stdout, stderr, result, results, List.of(), false);
+    }
+
+    private ExecutionOutcome structuredOutcome(Instant startedAt,
+                                                int exitCode,
+                                                Long affectedRows,
+                                                List<Map<String, Object>> rows,
+                                                String stdout,
+                                                String stderr,
+                                                Map<String, Object> result,
+                                                List<Map<String, Object>> results,
+                                                List<String> warnings,
+                                                boolean truncated) {
+        return structuredOutcome(startedAt, exitCode, affectedRows, rows, stdout, stderr, result, results, warnings,
+            truncated, null);
+    }
+
+    private ExecutionOutcome structuredOutcome(Instant startedAt,
+                                                int exitCode,
+                                                Long affectedRows,
+                                                List<Map<String, Object>> rows,
+                                                String stdout,
+                                                String stderr,
+                                                Map<String, Object> result,
+                                                List<Map<String, Object>> results,
+                                                List<String> warnings,
+                                                boolean truncated,
+                                                Map<String, Object> artifactResult) {
         long duration = Math.max(0, Duration.between(startedAt, Instant.now()).toMillis());
         return new ExecutionOutcome(duration, exitCode, affectedRows, rows, stdout, stderr,
-            result == null ? Map.of() : Map.copyOf(result));
+            result == null ? Map.of() : Map.copyOf(result), results == null ? List.of() : List.copyOf(results),
+            warnings == null ? List.of() : List.copyOf(warnings), truncated,
+            artifactResult == null ? Map.of() : Map.copyOf(artifactResult));
     }
 
     private int timeoutMillis(long timeoutMs) {
@@ -1437,20 +1712,42 @@ public class InfrastructureTaskExecutor {
 
     public record ExecutionOutcome(long durationMs,
                                    Integer exitCode,
-                                   Integer affectedRows,
+                                   Long affectedRows,
                                    List<Map<String, Object>> rows,
                                    String stdout,
                                    String stderr,
-                                   Map<String, Object> result) {
+                                   Map<String, Object> result,
+                                   List<Map<String, Object>> results,
+                                   List<String> warnings,
+                                   boolean truncated,
+                                   Map<String, Object> artifactResult) {
 
         public ExecutionOutcome(long durationMs,
                                 Integer exitCode,
-                                Integer affectedRows,
+                                Long affectedRows,
                                 List<Map<String, Object>> rows,
                                 String stdout,
                                 String stderr) {
-            this(durationMs, exitCode, affectedRows, rows, stdout, stderr, Map.of());
+            this(durationMs, exitCode, affectedRows, rows, stdout, stderr, Map.of(), List.of(), List.of(), false,
+                Map.of());
         }
+
+        public ExecutionOutcome(long durationMs,
+                                Integer exitCode,
+                                Long affectedRows,
+                                List<Map<String, Object>> rows,
+                                String stdout,
+                                String stderr,
+                                Map<String, Object> result) {
+            this(durationMs, exitCode, affectedRows, rows, stdout, stderr, result, List.of(), List.of(), false,
+                Map.of());
+        }
+    }
+
+    private record ResultSetPreview(Map<String, Object> result,
+                                    List<Map<String, Object>> legacyRows,
+                                    boolean truncated,
+                                    Map<String, Object> artifactResult) {
     }
 
     /** 附着隔离类加载器，连接关闭后由 JVM 在该任务对象回收时卸载厂商驱动。 */
