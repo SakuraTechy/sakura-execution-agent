@@ -121,6 +121,8 @@ Set-Location D:\King\sakura\sakura-execution-agent
 ### 4.2 正式安装或升级
 
 ```powershell
+Set-Location D:\King\sakura\sakura-execution-agent
+
 .\scripts\install-agent.ps1 `
   -InstallRoot 'C:\ProgramData\Sakura\execution-agent' `
   -Profiles mysql,postgresql `
