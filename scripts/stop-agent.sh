@@ -1,15 +1,21 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-INSTALL_ROOT="/opt/sakura-execution-agent"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+case "$SCRIPT_DIR" in
+  */scripts) DEFAULT_INSTALL_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)" ;;
+  *) DEFAULT_INSTALL_ROOT="$SCRIPT_DIR" ;;
+esac
+
+INSTALL_ROOT="$DEFAULT_INSTALL_ROOT"
 PORT="19091"
 SERVICE_NAME="sakura-execution-agent"
 TIMEOUT_SECONDS="10"
 
 usage() {
-  cat <<'USAGE'
+  cat <<USAGE
 用法：sudo bash scripts/stop-agent.sh [选项]
-  --install-root PATH   安装目录，默认 /opt/sakura-execution-agent
+  --install-root PATH   安装目录，默认 ${DEFAULT_INSTALL_ROOT}
   --port PORT           Agent 回环监听端口，默认 19091
   --service-name NAME   systemd 服务名，默认 sakura-execution-agent
   --timeout SECONDS     优雅停止等待秒数，默认 10，范围 1-60

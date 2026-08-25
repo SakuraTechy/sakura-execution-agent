@@ -1,0 +1,9 @@
+target/
+conf/known_hosts
+logs/
+workspace/
+data/
+src/test/
+scripts/
+README.md
+*.txt

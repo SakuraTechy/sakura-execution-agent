@@ -1,7 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-INSTALL_ROOT="${1:-/opt/sakura-execution-agent}"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+case "$SCRIPT_DIR" in
+  */scripts) DEFAULT_INSTALL_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)" ;;
+  *) DEFAULT_INSTALL_ROOT="$SCRIPT_DIR" ;;
+esac
+
+INSTALL_ROOT="${1:-$DEFAULT_INSTALL_ROOT}"
 PORT="${2:-19091}"
 failed="false"
 

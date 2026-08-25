@@ -29,7 +29,7 @@ trap {
 }
 
 $installPath = (Resolve-Path -LiteralPath $InstallRoot).Path
-$tokenPath = Join-Path $installPath 'conf\agent-token.machine'
+$envFilePath = Join-Path $installPath 'conf\agent.env'
 $jarPath = Join-Path $installPath 'sakura-execution-agent.jar'
 $driversPath = Join-Path $installPath 'drivers'
 $knownHostsPath = Join-Path $installPath 'conf\known_hosts'
@@ -39,7 +39,7 @@ $workspacePath = Join-Path $installPath 'workspace'
 # 任务账本必须放在 LOCAL SERVICE 可写的专用 workspace，安装根目录只读。
 $ledgerPath = Join-Path $workspacePath 'task-ledger.json'
 
-foreach ($requiredPath in @($tokenPath, $jarPath, $driversPath, $knownHostsPath, $workspacePath)) {
+foreach ($requiredPath in @($envFilePath, $jarPath, $driversPath, $knownHostsPath, $workspacePath)) {
     if (-not (Test-Path -LiteralPath $requiredPath)) {
         throw "Agent 启动文件不存在：$requiredPath"
     }
@@ -48,28 +48,21 @@ if (-not (Test-Path -LiteralPath $logDirectory)) {
     New-Item -ItemType Directory -Force $logDirectory | Out-Null
 }
 
-# Decrypt the machine-scoped DPAPI token. File ACL limits which accounts can read it.
-[byte[]]$protectedTokenBytes = New-Object byte[] ([int](Get-Item -LiteralPath $tokenPath).Length)
-$tokenStream = [IO.File]::OpenRead($tokenPath)
-try {
-    $offset = 0
-    while ($offset -lt $protectedTokenBytes.Length) {
-        $read = $tokenStream.Read($protectedTokenBytes, $offset, $protectedTokenBytes.Length - $offset)
-        if ($read -le 0) {
-            throw 'Agent DPAPI Token 文件读取不完整'
+function Read-AgentEnvToken {
+    param([string]$Path)
+    foreach ($line in Get-Content -LiteralPath $Path) {
+        if ($line -match '^SAKURA_AGENT_TOKEN=(.*)$') {
+            if ([string]::IsNullOrWhiteSpace($Matches[1])) {
+                throw "环境文件中的 SAKURA_AGENT_TOKEN 为空：$Path"
+            }
+            return $Matches[1]
         }
-        $offset += $read
     }
-} finally {
-    $tokenStream.Dispose()
+    throw "环境文件缺少 SAKURA_AGENT_TOKEN：$Path"
 }
-[byte[]]$entropy = [Text.Encoding]::UTF8.GetBytes('sakura-execution-agent-v1')
-if ($null -eq $protectedTokenBytes -or $protectedTokenBytes.Length -eq 0) {
-    throw 'Agent DPAPI token file is empty.'
-}
-[byte[]]$tokenBytes = [Security.Cryptography.ProtectedData]::Unprotect([byte[]]$protectedTokenBytes, $entropy, [Security.Cryptography.DataProtectionScope]::LocalMachine)
-$env:SAKURA_AGENT_TOKEN = [Text.Encoding]::UTF8.GetString($tokenBytes)
-[Array]::Clear($tokenBytes, 0, $tokenBytes.Length)
+
+# agent.env 同时供 Agent 和 Admin 使用；文件 ACL 限制了可读取的账号。
+$env:SAKURA_AGENT_TOKEN = Read-AgentEnvToken -Path $envFilePath
 
 try {
     & $JavaCommand `

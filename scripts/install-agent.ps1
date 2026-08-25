@@ -121,21 +121,6 @@ function New-AgentToken {
     }
 }
 
-function Protect-MachineToken {
-    param([string]$Token)
-    $plainBytes = [Text.Encoding]::UTF8.GetBytes($Token)
-    $entropy = [Text.Encoding]::UTF8.GetBytes('sakura-execution-agent-v1')
-    try {
-        return [Security.Cryptography.ProtectedData]::Protect(
-            [byte[]]$plainBytes,
-            [byte[]]$entropy,
-            [Security.Cryptography.DataProtectionScope]::LocalMachine
-        )
-    } finally {
-        [Array]::Clear($plainBytes, 0, $plainBytes.Length)
-    }
-}
-
 function Unprotect-MachineToken {
     param([string]$Path)
     [byte[]]$encryptedBytes = New-Object byte[] ([int](Get-Item -LiteralPath $Path).Length)
@@ -163,6 +148,21 @@ function Unprotect-MachineToken {
     } finally {
         [Array]::Clear($plainBytes, 0, $plainBytes.Length)
     }
+}
+
+function Read-AgentEnvToken {
+    param([string]$Path)
+    $token = $null
+    foreach ($line in Get-Content -LiteralPath $Path) {
+        if ($line -match '^SAKURA_AGENT_TOKEN=(.*)$') {
+            $token = $Matches[1]
+            break
+        }
+    }
+    if ([string]::IsNullOrWhiteSpace($token)) {
+        throw "环境文件缺少 SAKURA_AGENT_TOKEN：$Path"
+    }
+    return $token
 }
 
 function Set-RestrictedFileAcl {
@@ -251,27 +251,30 @@ foreach ($profile in $Profiles) {
     Copy-Item -LiteralPath $sourceProfile -Destination $targetProfile -Recurse
 }
 
-$machineTokenPath = Join-Path $installPath 'conf\agent-token.machine'
-$operatorTokenPath = Join-Path $installPath 'conf\agent-token.operator.clixml'
-if ((Test-Path -LiteralPath $machineTokenPath) -and -not $RotateToken) {
-    $agentToken = Unprotect-MachineToken -Path $machineTokenPath
+$currentUserSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+$envFilePath = Join-Path $installPath 'conf\agent.env'
+$legacyMachineTokenPath = Join-Path $installPath 'conf\agent-token.machine'
+$legacyOperatorTokenPath = Join-Path $installPath 'conf\agent-token.operator.clixml'
+if ((Test-Path -LiteralPath $envFilePath) -and -not $RotateToken) {
+    $agentToken = Read-AgentEnvToken -Path $envFilePath
+} elseif ((Test-Path -LiteralPath $legacyMachineTokenPath) -and -not $RotateToken) {
+    # 兼容旧版本安装，迁移完成后统一只保留 agent.env。
+    $agentToken = Unprotect-MachineToken -Path $legacyMachineTokenPath
+} elseif ((Test-Path -LiteralPath $legacyOperatorTokenPath) -and -not $RotateToken) {
+    $agentToken = (Import-Clixml -LiteralPath $legacyOperatorTokenPath).GetNetworkCredential().Password
 } else {
     $agentToken = New-AgentToken
 }
 
-# 重建文件而不是修改已有 ACL，避免重复安装依赖 SeSecurityPrivilege。
-if (Test-Path -LiteralPath $machineTokenPath) {
-    Remove-Item -LiteralPath $machineTokenPath -Force
+# Windows 与 Linux 统一使用 agent.env；ACL 限制安装账号和 LOCAL SERVICE 读取明文 Token。
+$envTempPath = Join-Path $installPath ("conf\agent.env.{0}.tmp" -f [guid]::NewGuid().ToString('N'))
+$envContent = "SAKURA_AGENT_TOKEN=$agentToken`r`nAUTOMATION_EXECUTION_AGENT_TOKEN=$agentToken`r`n"
+[IO.File]::WriteAllText($envTempPath, $envContent, [Text.UTF8Encoding]::new($false))
+Set-RestrictedFileAcl -Path $envTempPath -ReadSids @('S-1-5-19') -FullControlSids @($currentUserSid)
+Move-Item -LiteralPath $envTempPath -Destination $envFilePath -Force
+foreach ($legacyPath in @($legacyMachineTokenPath, $legacyOperatorTokenPath)) {
+    Remove-Item -LiteralPath $legacyPath -Force -ErrorAction SilentlyContinue
 }
-[IO.File]::WriteAllBytes($machineTokenPath, (Protect-MachineToken -Token $agentToken))
-$currentUserSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-Set-RestrictedFileAcl -Path $machineTokenPath -ReadSids @('S-1-5-19') -FullControlSids @($currentUserSid)
-$secureToken = ConvertTo-SecureString $agentToken -AsPlainText -Force
-if (Test-Path -LiteralPath $operatorTokenPath) {
-    Remove-Item -LiteralPath $operatorTokenPath -Force
-}
-[PSCredential]::new('sakura-execution-agent', $secureToken) | Export-Clixml -LiteralPath $operatorTokenPath
-Set-RestrictedFileAcl -Path $operatorTokenPath -ReadSids @() -FullControlSids @($currentUserSid)
 
 $manifest = foreach ($profile in $Profiles) {
     Get-ChildItem -LiteralPath (Join-Path $installPath "drivers\$profile") -Filter '*.jar' -File |
@@ -341,8 +344,8 @@ if (-not $SkipTaskRegistration) {
 }
 
 Write-Host "Agent 安装完成：$installPath"
-Write-Host "Admin Token（CLIXML 格式）：$operatorTokenPath"
-Write-Host "Admin Token（当前操作账号 DPAPI）：$agentToken"
-Write-Host 'Admin 启动前通过 Import-Clixml 读取同一个 Token，不要重新生成。'
+Write-Host "统一 Token 文件：$envFilePath"
+Write-Host "Admin Token：$agentToken"
+Write-Host 'Admin 启动前从 agent.env 注入 AUTOMATION_EXECUTION_AGENT_TOKEN，不要重新生成。'
 
-Remove-Variable agentToken,secureToken -ErrorAction SilentlyContinue
+Remove-Variable agentToken -ErrorAction SilentlyContinue

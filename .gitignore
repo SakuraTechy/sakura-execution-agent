@@ -8,3 +8,5 @@
 /conf/agent-token.clixml
 /conf/agent-token.machine
 /conf/agent-token.operator.clixml
+/conf/agent.env
+/conf/agent.env.*
