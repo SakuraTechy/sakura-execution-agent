@@ -18,16 +18,17 @@ RUN apt-get update \
 
 COPY --from=build /build/target/sakura-execution-agent-0.1.0-SNAPSHOT.jar "$AGENT_HOME/sakura-execution-agent.jar"
 COPY drivers/ "$AGENT_HOME/drivers/"
+COPY conf/agent-config.yml "$AGENT_HOME/conf/agent-config.yml"
 # 仅作为镜像内默认文件；生产部署应挂载经过带外核对的 known_hosts。
 COPY conf/known_hosts.example "$AGENT_HOME/conf/known_hosts"
 
 RUN chown -R sakura:sakura "$AGENT_HOME" \
     && chmod 0750 "$AGENT_HOME" "$AGENT_HOME"/drivers "$AGENT_HOME"/conf \
-    && chmod 0640 "$AGENT_HOME/conf/known_hosts"
+    && chmod 0640 "$AGENT_HOME/conf/known_hosts" "$AGENT_HOME/conf/agent-config.yml"
 
 USER sakura
 WORKDIR "$AGENT_HOME"
 
 EXPOSE 19091
 
-ENTRYPOINT ["java", "-Dsakura.agent.bind=127.0.0.1", "-Dsakura.agent.port=19091", "-Dsakura.agent.driver-dir=/app/sakura-execution-agent/drivers", "-Dsakura.agent.known-hosts=/app/sakura-execution-agent/conf/known_hosts", "-Dsakura.agent.log-file=/app/sakura-execution-agent/logs/agent.log", "-Dsakura.agent.workspace=/app/sakura-execution-agent/workspace", "-Dsakura.agent.ledger-file=/app/sakura-execution-agent/data/task-ledger.json", "-jar", "/app/sakura-execution-agent/sakura-execution-agent.jar"]
+ENTRYPOINT ["java", "-Dsakura.agent.config=/app/sakura-execution-agent/conf/agent-config.yml", "-Dsakura.agent.bind=127.0.0.1", "-Dsakura.agent.port=19091", "-jar", "/app/sakura-execution-agent/sakura-execution-agent.jar"]

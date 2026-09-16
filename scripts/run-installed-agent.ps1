@@ -30,17 +30,16 @@ trap {
 
 $installPath = (Resolve-Path -LiteralPath $InstallRoot).Path
 $envFilePath = Join-Path $installPath 'conf\agent.env'
+$configPath = Join-Path $installPath 'conf\agent-config.yml'
 $jarPath = Join-Path $installPath 'sakura-execution-agent.jar'
-$driversPath = Join-Path $installPath 'drivers'
-$knownHostsPath = Join-Path $installPath 'conf\known_hosts'
 $logDirectory = Join-Path $installPath 'logs'
-$logPath = Join-Path $logDirectory 'agent.log'
 $workspacePath = Join-Path $installPath 'workspace'
-# 任务账本必须放在 LOCAL SERVICE 可写的专用 workspace，安装根目录只读。
+# 保留 Windows 已有账本位置，避免升级后切换到 YAML 默认 data 路径而丢失任务恢复状态。
 $ledgerPath = Join-Path $workspacePath 'task-ledger.json'
 
-foreach ($requiredPath in @($envFilePath, $jarPath, $driversPath, $knownHostsPath, $workspacePath)) {
-    if (-not (Test-Path -LiteralPath $requiredPath)) {
+# drivers、known_hosts 和 workspace 由 YAML 决定，不能用默认路径的存在性阻止自定义配置启动。
+foreach ($requiredPath in @($envFilePath, $configPath, $jarPath)) {
+    if (-not (Test-Path -LiteralPath $requiredPath -PathType Leaf)) {
         throw "Agent 启动文件不存在：$requiredPath"
     }
 }
@@ -64,14 +63,14 @@ function Read-AgentEnvToken {
 # agent.env 同时供 Agent 和 Admin 使用；文件 ACL 限制了可读取的账号。
 $env:SAKURA_AGENT_TOKEN = Read-AgentEnvToken -Path $envFilePath
 
+# 只有成功压入目录后才进入 finally，避免切换失败时弹出调用方的目录栈。
+Push-Location -LiteralPath $installPath
 try {
+    # 手工调用和计划任务都以安装目录解析 YAML 相对路径，不能依赖调用者的当前目录。
     & $JavaCommand `
+        "-Dsakura.agent.config=$configPath" `
         '-Dsakura.agent.bind=127.0.0.1' `
         "-Dsakura.agent.port=$Port" `
-        "-Dsakura.agent.driver-dir=$driversPath" `
-        "-Dsakura.agent.known-hosts=$knownHostsPath" `
-        "-Dsakura.agent.log-file=$logPath" `
-        "-Dsakura.agent.workspace=$workspacePath" `
         "-Dsakura.agent.ledger-file=$ledgerPath" `
         -jar $jarPath 2>> $bootstrapLogPath
     $javaExitCode = $LASTEXITCODE
@@ -80,5 +79,6 @@ try {
     }
     exit 0
 } finally {
+    Pop-Location
     Remove-Item Env:SAKURA_AGENT_TOKEN -ErrorAction SilentlyContinue
 }

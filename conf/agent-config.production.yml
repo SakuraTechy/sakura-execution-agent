@@ -1,0 +1,43 @@
+# Sakura Execution Agent 配置文件示例（生产环境）
+# 生产环境推荐配置：启用主机密钥校验，关闭跳过选项
+
+# SSH 连接配置
+ssh:
+  # 生产环境必须强制校验主机密钥
+  skip-host-key-check: false
+
+  # known_hosts 文件路径
+  known-hosts: /etc/sakura/known_hosts
+
+# JDBC 驱动配置
+jdbc:
+  driver-dir: /opt/sakura/drivers
+
+# 本地文件操作配置
+local-action:
+  workspace: /data/sakura/workspace
+
+  allow-roots: []
+
+# 日志配置
+logging:
+  file: /var/log/sakura/agent.log
+
+# 任务持久化配置
+task:
+  ledger-file: /data/sakura/task-ledger.json
+
+# HTTP 服务配置
+server:
+  bind: 127.0.0.1
+  port: 19091
+
+# 可选功能配置
+features:
+  captcha-ocr:
+    enabled: false
+
+  desktop:
+    enabled: false
+
+  runtime-properties: {}

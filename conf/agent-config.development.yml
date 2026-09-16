@@ -1,0 +1,44 @@
+# Sakura Execution Agent 配置文件示例（开发测试环境）
+# 开发测试环境可选配置：跳过主机密钥校验，简化内网连接
+
+# SSH 连接配置
+ssh:
+  # 开发测试环境可以跳过主机密钥校验
+  # 警告：仅适用于内网隔离测试环境，生产环境必须设置为 false
+  skip-host-key-check: true
+
+  # 当 skip-host-key-check=true 时，此项可不配置
+  # known-hosts: conf/known_hosts
+
+# JDBC 驱动配置
+jdbc:
+  driver-dir: drivers
+
+# 本地文件操作配置
+local-action:
+  workspace: workspace
+
+  allow-roots: []
+
+# 日志配置
+logging:
+  file: logs/agent.log
+
+# 任务持久化配置
+task:
+  ledger-file: data/task-ledger.json
+
+# HTTP 服务配置
+server:
+  bind: 127.0.0.1
+  port: 19091
+
+# 可选功能配置
+features:
+  captcha-ocr:
+    enabled: false
+
+  desktop:
+    enabled: false
+
+  runtime-properties: {}

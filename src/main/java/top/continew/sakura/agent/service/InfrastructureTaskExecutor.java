@@ -78,7 +78,7 @@ public class InfrastructureTaskExecutor {
     private static final int MAX_ATTACHMENT_ROWS = 10_000;
     private static final int DEFAULT_MAX_FILE_RESULTS = 200;
     private static final int MAX_FILE_RESULTS = 1_000;
-    private static final int DEFAULT_MAX_IP_PROBES = 64;
+    private static final int DEFAULT_MAX_IP_PROBES = 254;
     private static final int MAX_CAPTCHA_IMAGE_BYTES = 2 * 1024 * 1024;
     private final ObjectMapper objectMapper;
     private final Path driverDirectory;
@@ -135,6 +135,7 @@ public class InfrastructureTaskExecutor {
     }
 
     private ExecutionOutcome executeSsh(InfrastructureTaskRequest request, Instant startedAt) throws Exception {
+        ServerCommandResultProcessor.validate(request);
         if (request.sshTarget() == null || isBlank(request.command())) {
             throw new IllegalArgumentException("服务器命令缺少目标或命令内容");
         }
@@ -148,17 +149,14 @@ public class InfrastructureTaskExecutor {
         logger.info("SSH_TARGET_VALIDATED", request.taskId(), request.actionType(), "host=" + target.host() + " port="
             + (target.port() == null ? 22 : target.port()) + " timeoutMs=" + timeoutMillis(request.timeoutMs())
             + " platform=" + platform + " shell=" + shell + " commandLength=" + request.command().length());
-        requireKnownHosts();
-        String knownHostsPath = System.getProperty("sakura.agent.known-hosts");
-        logger.info("SSH_KNOWN_HOSTS_VALIDATED", request.taskId(), request.actionType(),
-            "file=" + knownHostsPath + " strictHostKeyChecking=yes");
+
         JSch jsch = new JSch();
-        jsch.setKnownHosts(System.getProperty("sakura.agent.known-hosts"));
         Session session = jsch.getSession(target.username(), target.host(), target.port() == null ? 22 : target.port());
         if (!isBlank(target.password())) {
             session.setPassword(target.password());
         }
-        session.setConfig("StrictHostKeyChecking", "yes");
+
+        configureHostKeyChecking(jsch, session, request, "SSH");
         ChannelExec channel = null;
         try {
             logger.info("SSH_CONNECTING", request.taskId(), request.actionType(),
@@ -227,7 +225,11 @@ public class InfrastructureTaskExecutor {
                 }
             }
             int exitCode = channel.getExitStatus();
-            ExecutionOutcome outcome = outcome(startedAt, exitCode, null, null, output.text(), stderr.text());
+            Map<String, Object> result = ServerCommandResultProcessor.process(request, exitCode, output.text(), output.truncated());
+            // 变量保留真实值；敏感步骤的输出预览和附件只能看到脱敏副本。
+            boolean masked = Boolean.TRUE.equals(request.valueMasked());
+            ExecutionOutcome outcome = outcome(startedAt, exitCode, null, null,
+                masked ? "[已脱敏]" : output.text(), masked ? "[已脱敏]" : stderr.text(), result);
             logger.info("SSH_COMMAND_COMPLETED", request.taskId(), request.actionType(), "durationMs=" + outcome.durationMs()
                 + " exitCode=" + exitCode + " stdoutBytes=" + output.size() + " stderrBytes=" + stderr.size());
             return outcome;
@@ -615,6 +617,11 @@ public class InfrastructureTaskExecutor {
      */
     private ExecutionOutcome executeCaptchaOcr(InfrastructureTaskRequest request, Instant startedAt) throws Exception {
         requireCapability(request, "captcha_ocr", false);
+        // 开关与健康快照保持一致；即使 Python 和脚本已配置，显式关闭后也不能执行。
+        if (System.getProperties().containsKey("sakura.agent.captcha-ocr-enabled")
+            && !Boolean.parseBoolean(System.getProperty("sakura.agent.captcha-ocr-enabled"))) {
+            throw new AgentExecutionException("CAPTCHA_OCR_DISABLED", "执行节点已关闭验证码 OCR");
+        }
         String variableName = validateVariableName(request.variableName());
         String imageBase64 = String.valueOf(request.captchaImageBase64()).trim();
         if (imageBase64.isBlank() || "null".equals(imageBase64)) {
@@ -685,14 +692,14 @@ public class InfrastructureTaskExecutor {
         }
         String requestedRemotePath = normalizeRemotePath(request.remotePath());
         InfrastructureTaskRequest.SshTarget target = request.sshTarget();
-        requireKnownHosts();
+
         JSch jsch = new JSch();
-        jsch.setKnownHosts(System.getProperty("sakura.agent.known-hosts"));
         Session session = jsch.getSession(target.username(), target.host(), target.port() == null ? 22 : target.port());
         if (!isBlank(target.password())) {
             session.setPassword(target.password());
         }
-        session.setConfig("StrictHostKeyChecking", "yes");
+
+        configureHostKeyChecking(jsch, session, request, "SFTP");
         session.setTimeout(timeoutMillis(request.timeoutMs()));
         ChannelSftp channel = null;
         try {
@@ -1001,7 +1008,12 @@ public class InfrastructureTaskExecutor {
         if (isBlank(rawPrefix)) {
             throw new AgentExecutionException("AVAILABLE_IP_PREFIX_INVALID", "可用 IP 探测缺少 IPv4 前缀");
         }
-        String[] parts = rawPrefix.trim().split("\\.", -1);
+        String normalizedPrefix = rawPrefix.trim();
+        // 兼容历史正则提取结果的末尾点，但仍严格拒绝完整 IP 或连续分隔符。
+        if (normalizedPrefix.endsWith(".") && !normalizedPrefix.endsWith("..")) {
+            normalizedPrefix = normalizedPrefix.substring(0, normalizedPrefix.length() - 1);
+        }
+        String[] parts = normalizedPrefix.split("\\.", -1);
         if (parts.length != 3) {
             throw new AgentExecutionException("AVAILABLE_IP_PREFIX_INVALID", "可用 IP 探测只接受三个网段的 IPv4 前缀");
         }
@@ -1385,11 +1397,23 @@ public class InfrastructureTaskExecutor {
         return values == null ? new Document() : new Document(values);
     }
 
-    private void requireKnownHosts() {
+    // 两条连接链路共享安全开关，避免 SSH 与 SFTP 的默认校验行为漂移。
+    void configureHostKeyChecking(JSch jsch, Session session, InfrastructureTaskRequest request, String protocol)
+        throws JSchException {
+        if (Boolean.getBoolean("sakura.agent.ssh-skip-host-key-check")) {
+            session.setConfig("StrictHostKeyChecking", "no");
+            logger.warn(protocol + "_HOST_KEY_CHECK_DISABLED", request.taskId(), request.actionType(),
+                "host=" + session.getHost() + " strictHostKeyChecking=no reason=sakura.agent.ssh-skip-host-key-check=true");
+            return;
+        }
         String knownHosts = System.getProperty("sakura.agent.known-hosts");
         if (isBlank(knownHosts) || !Files.isRegularFile(Path.of(knownHosts))) {
             throw new IllegalStateException("SSH 执行节点未配置受信任主机文件 sakura.agent.known-hosts");
         }
+        jsch.setKnownHosts(knownHosts);
+        session.setConfig("StrictHostKeyChecking", "yes");
+        logger.info(protocol + "_KNOWN_HOSTS_VALIDATED", request.taskId(), request.actionType(),
+            "file=" + knownHosts + " strictHostKeyChecking=yes");
     }
 
     private void cancelStatement(Statement statement, Connection connection) {

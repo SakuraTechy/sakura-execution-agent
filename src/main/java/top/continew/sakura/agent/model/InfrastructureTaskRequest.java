@@ -5,6 +5,7 @@ import java.util.Map;
 
 import com.fasterxml.jackson.annotation.JsonAlias;
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import com.fasterxml.jackson.annotation.JsonInclude;
 
 /** Agent 的短时执行请求；只允许在本机受控链路上传输。 */
 @JsonIgnoreProperties(ignoreUnknown = true)
@@ -51,7 +52,10 @@ public record InfrastructureTaskRequest(@JsonAlias({"task_id"}) String taskId,
                                         @JsonAlias({"risk_level"}) String riskLevel,
                                         @JsonAlias({"read_only_enforced"}) Boolean readOnlyEnforced,
                                         @JsonAlias({"command_template_id"}) String commandTemplateId,
-                                        @JsonAlias({"approval_digest"}) String approvalDigest) {
+                                        @JsonAlias({"approval_digest"}) String approvalDigest,
+                                        @JsonInclude(JsonInclude.Include.NON_NULL) @JsonAlias({"replace_regex"}) String replaceRegex,
+                                        @JsonInclude(JsonInclude.Include.NON_NULL) @JsonAlias({"replace_value"}) String replaceValue,
+                                        @JsonInclude(JsonInclude.Include.NON_NULL) @JsonAlias({"value_masked"}) Boolean valueMasked) {
 
     public record SshTarget(String host,
                             Integer port,

@@ -7,6 +7,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Properties;
 import java.util.Set;
 
 /**
@@ -48,6 +49,50 @@ public final class LocalActionPolicy {
         return new LocalActionPolicy(workspace, parseConfiguredRoots(System.getProperty(ALLOW_ROOTS_PROPERTY)));
     }
 
+    /**
+     * 安装预检不得创建目录；workspace 可由安装器随后创建，其余授权目录必须已经存在。
+     */
+    public static void validateConfiguration(Properties properties) {
+        String workspace = properties.getProperty(WORKSPACE_PROPERTY);
+        if (isBlank(workspace)) {
+            throw new IllegalArgumentException(WORKSPACE_PROPERTY + " 不能为空");
+        }
+        validateAbsoluteDirectoryProperty(workspace, WORKSPACE_PROPERTY, false);
+        Path workspacePath = Path.of(workspace).normalize();
+        if (Files.exists(workspacePath, LinkOption.NOFOLLOW_LINKS)
+            && (!Files.isDirectory(workspacePath, LinkOption.NOFOLLOW_LINKS) || Files.isSymbolicLink(workspacePath))) {
+            throw new IllegalArgumentException(WORKSPACE_PROPERTY + " 必须是非符号链接目录");
+        }
+        String roots = properties.getProperty(ALLOW_ROOTS_PROPERTY, "");
+        for (String root : roots.split("[;,]")) {
+            if (!isBlank(root)) {
+                validateAbsoluteDirectoryProperty(root.trim(), ALLOW_ROOTS_PROPERTY, true);
+                Path rootPath = Path.of(root.trim());
+                if (!rootPath.normalize().equals(workspacePath)) {
+                    resolveConfiguredRoot(rootPath);
+                }
+            }
+        }
+        if (Boolean.parseBoolean(properties.getProperty("sakura.agent.captcha-ocr-enabled", "false"))) {
+            if (isBlank(properties.getProperty("sakura.agent.captcha-ocr-python"))
+                || isBlank(properties.getProperty("sakura.agent.captcha-ocr-script"))) {
+                throw new IllegalArgumentException("启用 captcha OCR 时必须同时配置 Python 命令和脚本");
+            }
+        }
+    }
+
+    private static void validateAbsoluteDirectoryProperty(String raw, String property, boolean rejectParent) {
+        Path path;
+        try {
+            path = Path.of(raw);
+        } catch (RuntimeException exception) {
+            throw new IllegalArgumentException(property + " 路径格式非法", exception);
+        }
+        if (!path.isAbsolute() || (rejectParent && containsParentSegment(path)) || isUnsafeRoot(path)) {
+            throw new IllegalArgumentException(property + " 必须是安全的绝对目录路径");
+        }
+    }
+
     public Path workspaceRoot() {
         return workspaceRoot;
     }
@@ -68,6 +113,10 @@ public final class LocalActionPolicy {
 
     /** OCR 能力只有在解释器和安全目录内的脚本都已配置时才进入健康快照。 */
     public boolean hasCaptchaOcrConfiguration() {
+        if (System.getProperties().containsKey("sakura.agent.captcha-ocr-enabled")
+            && !Boolean.parseBoolean(System.getProperty("sakura.agent.captcha-ocr-enabled"))) {
+            return false;
+        }
         String python = System.getProperty("sakura.agent.captcha-ocr-python", "").trim();
         String script = System.getProperty("sakura.agent.captcha-ocr-script", "").trim();
         if (python.isBlank() || script.isBlank()) {
@@ -188,7 +237,7 @@ public final class LocalActionPolicy {
         }
     }
 
-    private Path resolveConfiguredRoot(Path root) {
+    private static Path resolveConfiguredRoot(Path root) {
         if (root == null || !root.isAbsolute()) {
             throw new IllegalStateException("sakura.agent.file-allow-roots 只能配置绝对目录");
         }
@@ -206,7 +255,7 @@ public final class LocalActionPolicy {
         }
     }
 
-    private boolean isUnsafeRoot(Path path) {
+    private static boolean isUnsafeRoot(Path path) {
         Path normalized = path.toAbsolutePath().normalize();
         Path root = normalized.getRoot();
         if (root != null && normalized.equals(root)) {
@@ -229,7 +278,7 @@ public final class LocalActionPolicy {
         return paths;
     }
 
-    private boolean containsParentSegment(Path path) {
+    private static boolean containsParentSegment(Path path) {
         for (Path segment : path) {
             if ("..".equals(segment.toString())) {
                 return true;

@@ -3,6 +3,7 @@
 `sakura-execution-agent` 是部署在 Playwright Runner 执行节点上的本机基础设施执行器，负责真实执行：
 
 - SSH 服务器命令；
+- SFTP 文件上传；
 - 22 个 JDBC 数据库 profile；
 - MongoDB 原生操作。
 
@@ -47,7 +48,13 @@ sakura-execution-agent/
 │  ├─ mysql/*.jar
 │  ├─ oracle/*.jar
 │  └─ ...
-├─ conf/known_hosts               # 按执行节点维护，不提交真实内容
+├─ conf/
+│  ├─ agent-config.yml            # 安装时使用的 YAML 配置
+│  ├─ agent-config.development.yml # 受控隔离测试环境示例
+│  ├─ agent-config.production.yml  # Linux 生产配置示例，需调整绝对路径
+│  └─ known_hosts                 # 按执行节点维护，不提交真实内容
+├─ docs/
+│  └─ 1.SSH 主机密钥校验配置说明.md
 ├─ scripts/
 │  ├─ build-drivers.ps1
 │  ├─ install-agent.ps1           # Windows 部署/升级
@@ -125,18 +132,18 @@ MongoDB 不需要 `mongodb` profile。MongoDB Java Driver 已由根目录 `pom.x
 `Dockerfile` 使用多阶段构建 Agent JAR，并将 Agent 以低权限用户运行。`sakura-admin/docker/docker-compose.yml` 通过
 `network_mode: service:sakura-execution-agent` 让 Admin 与 Agent 共享网络命名空间，因此 Admin 仍可安全访问
 `http://127.0.0.1:19091`，Agent 不需要监听 `0.0.0.0` 或暴露 `19091` 到宿主机。
-Docker 镜像内 Agent 运行目录统一为 `/app/sakura-execution-agent`；宿主机的 `execution-agent/conf`、`logs`、`workspace` 和 `data`
-分别挂载到该目录下的对应子目录。Linux systemd 安装仍使用 `/opt/sakura-execution-agent`，两者互不影响。
+Docker 镜像内 Agent 运行目录统一为 `/app/sakura-execution-agent`；宿主机的 `sakura-admin/docker/sakura-execution-agent/`
+下的 `conf`、`logs`、`workspace` 和 `data` 分别挂载到对应子目录。整个 `conf` 目录挂载后会遮蔽镜像内的默认 YAML，
+因此宿主机必须同时提供 `conf/agent-config.yml` 和经过带外核对的 `conf/known_hosts`。
+镜像内显式加载 `/app/sakura-execution-agent/conf/agent-config.yml`；修改挂载的 YAML 后需要重启 Agent 容器才能生效。
 
 部署前准备经过带外核对的 `known_hosts`：
 
 ```bash
 cd /path/to/sakura-admin/docker
 # Compose 会自动读取当前目录的 .env；首次部署请先按实际环境修改其中的端口、密码和调度 Token。
-mkdir -p execution-agent/conf execution-agent/logs execution-agent/workspace execution-agent/data
-cp /path/to/known_hosts execution-agent/conf/known_hosts
 sudo bash /path/to/sakura-execution-agent/scripts/install-agent.sh \
-  --install-root /opt/sakura-execution-agent \
+  --install-root "$PWD/sakura-execution-agent" \
   --known-hosts /path/to/known_hosts \
   --skip-service
 bash start-docker.sh
@@ -144,7 +151,7 @@ docker compose ps
 docker compose exec sakura-execution-agent curl --fail http://127.0.0.1:19091/health
 ```
 
-`install-agent.sh` 负责生成或复用 `/etc/sakura-execution-agent/agent.env`，Compose 同时将其中的
+`install-agent.sh` 负责复制或保留 YAML，并生成或复用 `sakura-execution-agent/conf/agent.env`，Compose 同时将其中的
 `SAKURA_AGENT_TOKEN` 和 `AUTOMATION_EXECUTION_AGENT_TOKEN` 注入 Agent 与 Admin。不要再用 `openssl` 另行生成 Token，
 也不要把真实 `agent.env` 或 `known_hosts` 提交到仓库。若主机上已有 systemd Agent，切换容器前先停止它，避免占用本机资源：
 
@@ -177,13 +184,18 @@ Set-Location D:\King\sakura\sakura-execution-agent
 .\scripts\install-agent.ps1 `
   -InstallRoot 'D:\King\sakura\sakura-admin\docker\sakura-execution-agent' `
   -Profiles mysql,oracle,postgresql `
-  -KnownHostsPath .\conf\known_hosts `
+  -KnownHostsPath '.\conf\known_hosts' `
+  -Port 19091 `
   -PlanOnly
 ```
 
-`-PlanOnly` 只检查 JAR、Java、profile、端口和 `known_hosts`，不会复制文件、生成 Token 或注册计划任务。
+`-PlanOnly` 检查 JAR、Java、profile、端口参数和 `known_hosts`，并用待安装 JAR 预检实际将使用的 YAML；
+不会创建目录、复制文件、读取或生成 Token、停止 Agent、占用监听端口或注册计划任务，也不连接 SSH 或数据库。
+预检通过只说明配置可解析且通过规则检查，不代表目标主机公钥已受信任，也不能代替服务账号权限和真实连接验证。
 
 ### 4.2 正式安装或升级
+
+默认安装方式：首次复制源码目录的 YAML，升级时保留安装目录已有 YAML。核对计划后在维护窗口执行：
 
 ```powershell
 Set-Location D:\King\sakura\sakura-execution-agent
@@ -195,17 +207,42 @@ Set-Location D:\King\sakura\sakura-execution-agent
   -Port 19091
 ```
 
+仅在需要替换整个现场 YAML 时，改用下面的方式先预检。此示例与上例是两种配置选择方式，不需要依次安装两遍：
+
+```powershell
+.\scripts\install-agent.ps1 `
+  -InstallRoot 'D:\King\sakura\sakura-admin\docker\sakura-execution-agent' `
+  -AgentConfigPath '.\conf\agent-config.yml' `
+  -Profiles mysql,oracle,postgresql `
+  -KnownHostsPath '.\conf\known_hosts' `
+  -Port 19091 `
+  -PlanOnly
+```
+
+`-AgentConfigPath` 替换整个 YAML，不做字段合并。先备份现场配置并人工合并自定义路径、授权项等，
+确认预检输出中的 `sshSkipHostKeyCheck` 符合预期，再在维护窗口去掉 `-PlanOnly` 执行。
+若现场已将开关改为 `true`，不需要替换 YAML 时应省略 `-AgentConfigPath`，避免被另一份配置覆盖。
+
 正式安装会：
 
-1. 停止已有 `SakuraExecutionAgent` 计划任务；
-2. 停止命令行明确指向该安装目录 JAR 的旧 Agent；
-3. 复制 JAR、驱动、`known_hosts` 和运行/检查/停止脚本；
-4. 首次安装生成 Token，重复安装默认复用 Token；
-5. 生成统一的 `conf\agent.env`，并限制文件 ACL；
-6. 注册由 `LOCAL SERVICE` 运行的开机计划任务；
-7. 启动 Agent 并检查 `/health`。
+1. 使用待安装 JAR 预检 YAML，失败时保留当前运行的 Agent；
+2. 停止已有 `SakuraExecutionAgent` 计划任务；
+3. 停止命令行明确指向该安装目录 JAR 的旧 Agent；
+4. 复制 JAR、驱动、`known_hosts` 和运行/检查/停止脚本，首次复制 YAML、重装默认保留现场 YAML；
+5. 首次安装生成 Token，重复安装默认复用 Token；
+6. 生成统一的 `conf\agent.env`，并限制文件 ACL；
+7. 注册由 `LOCAL SERVICE` 运行的开机计划任务；
+8. 启动 Agent 并检查 `/health`。
 
 除非要在维护窗口同步更新 Admin，否则不要使用 `-RotateToken`。轮换 Token 后必须同步修改 Admin 配置并重启 Admin。
+
+Windows 启动脚本显式读取 `<InstallRoot>\conf\agent-config.yml`，并以安装目录解析其中的相对路径。
+例如 `known-hosts: conf/known_hosts` 指向 `<InstallRoot>\conf\known_hosts`，不是源码目录或 `System32`。
+自定义目录需提前授予 `LOCAL SERVICE` 必要的读写权限，安装器只管理默认目录的权限。
+旧模板中的空 `runtime-properties:` 应改为 `runtime-properties: {}`；
+不需要额外文件授权时使用 `allow-roots: []`，需要时必须预先创建安全目录。
+PowerShell 续行符是行尾反引号，后面不能跟空格；文件名是 `known_hosts`，不要写成 `known\_hosts`。
+完整配置、优先级和预检命令见 [SSH 主机密钥校验配置说明](<docs/1.SSH 主机密钥校验配置说明.md>)。
 
 ### 4.3 Token 来源
 
@@ -247,6 +284,7 @@ Start-ScheduledTask -TaskName 'SakuraExecutionAgent'
 ```
 
 停止脚本只匹配当前安装目录的 Agent，不会按端口误杀其他 Java 进程。若 `19091` 仍被其他程序占用，脚本会报告 PID 并退出。
+修改 YAML 后需要执行上述停止、启动流程；配置只在 JVM 启动时加载，`/health` 正常不能证明主机密钥策略符合预期，仍需核对第 8 节日志。
 
 ## 5. Linux 部署
 
@@ -259,13 +297,19 @@ bash scripts/install-agent.sh \
   --install-root '/data/sakura/sakura-admin/docker/sakura-execution-agent' \
   --profiles mysql,oracle,postgresql \
   --known-hosts ./conf/known_hosts \
+  --port 19091 \
   --plan-only
 ```
 
+`--plan-only` 只做安装计划和 YAML 预检，不创建目录、不读取 Token、不停止服务、不占用监听端口，也不连接 SSH 或数据库。
+预检已有安装目录时，执行账号仍需有权读取现场配置。
+
 ### 5.2 正式安装或升级
 
+默认安装方式：首次复制源码 YAML，升级时保留安装目录已有 YAML。核对计划后在维护窗口执行：
+
 ```bash
-bash scripts/install-agent.sh \
+sudo bash scripts/install-agent.sh \
   --install-root '/data/sakura/sakura-admin/docker/sakura-execution-agent' \
   --profiles mysql,oracle,postgresql \
   --known-hosts ./conf/known_hosts \
@@ -273,19 +317,43 @@ bash scripts/install-agent.sh \
   --port 19091
 ```
 
+需要替换整个现场 YAML 时，改用以下方式先预检，不需要与上例依次执行：
+
+```bash
+bash scripts/install-agent.sh \
+  --install-root '/data/sakura/sakura-admin/docker/sakura-execution-agent' \
+  --agent-config './conf/agent-config.yml' \
+  --profiles mysql,oracle,postgresql \
+  --known-hosts ./conf/known_hosts \
+  --env-root '/data/sakura/sakura-admin/docker/sakura-execution-agent/conf/agent.env' \
+  --port 19091 \
+  --plan-only
+```
+
+`--agent-config` 与 Windows 的 `-AgentConfigPath` 对应，替换整个 YAML，不做字段合并。
+先备份并人工合并现场自定义项，确认预检输出中的 `sshSkipHostKeyCheck` 后，在维护窗口去掉 `--plan-only` 并以 root 权限执行。
+
 `--install-root` 和 `--env-root` 支持相对路径，按执行命令所在目录解析；`--env-root` 可以传环境文件目录，也可以直接传以 `.env` 结尾的文件路径。systemd unit 中会使用规范化后的绝对路径。
 
-脚本会创建低权限 `sakura` 账号、复制 JAR/驱动、生成或复用 Token、创建 `/etc/sakura-execution-agent/agent.env`、注册 systemd 服务并检查 `/health`。升级时会先停止旧服务或当前安装目录下的手工 Agent，再覆盖 JAR。
+脚本会先用待安装 JAR 预检 YAML，再创建低权限 `sakura` 账号、复制 JAR/驱动和配置、生成或复用 Token、注册 systemd 服务并检查 `/health`。
+Token 文件默认位于 `<InstallRoot>/conf/agent.env`，也可通过 `--env-root` 指定。升级时会先停止旧服务或当前安装目录下的手工 Agent，再覆盖 JAR。
+
+systemd 使用安装目录作为 `WorkingDirectory`，显式加载 `<InstallRoot>/conf/agent-config.yml`，YAML 中的相对路径按安装目录解析。
+默认 `conf` 目录为 `root:sakura 0750`，YAML 和 `known_hosts` 为 `0640`；自定义服务组时将 `sakura` 替换为对应组名。
+不要为了保护 Token 把共用的 `conf` 改成 `0700`，否则服务账号无法读取 YAML 和主机公钥文件。
+额外的工作目录、日志目录和授权目录需预先创建，并授予服务账号必要权限。
 
 脚本会自动检查 `PATH`、`JAVA_HOME`、`/usr/lib/jvm`、`/usr/local`、`/opt`、SDKMAN 用户目录和 `/etc/alternatives` 中的 Java 17+。如果 JDK 安装在非标准目录，再通过 `--java-command` 传入绝对路径。
 
 ### 5.3 Token 文件
 
+以上安装示例使用：
+
 ```text
-/etc/sakura-execution-agent/agent.env
+/data/sakura/sakura-admin/docker/sakura-execution-agent/conf/agent.env
 ```
 
-该文件由 root 创建，权限必须为 `0600`，包含：
+该文件保持 `root:root 0600`，由 systemd 读取并注入 Agent 环境，不需要授予服务账号直接读取 Token 文件的权限。文件包含：
 
 ```text
 SAKURA_AGENT_TOKEN=<同一个随机共享令牌>
@@ -295,8 +363,8 @@ AUTOMATION_EXECUTION_AGENT_TOKEN=<同一个随机共享令牌>
 Admin 和 Agent 必须使用同一个 Token。查看文件时只确认变量名和权限，不要把值输出到终端或日志：
 
 ```bash
-sudo stat -c '%U:%G %a %n' /etc/sakura-execution-agent/agent.env
-sudo awk -F= '{print $1"=<redacted>"}' /etc/sakura-execution-agent/agent.env
+sudo stat -c '%U:%G %a %n' /data/sakura/sakura-admin/docker/sakura-execution-agent/conf/agent.env
+sudo awk -F= '{print $1"=<redacted>"}' /data/sakura/sakura-admin/docker/sakura-execution-agent/conf/agent.env
 ```
 
 ### 5.4 停止、启动和验收
@@ -318,9 +386,15 @@ sudo journalctl -u sakura-execution-agent -n 100 --no-pager
 sudo "$INSTALL_ROOT/check-agent.sh"
 ```
 
-## 6. known_hosts 配置
+修改 YAML 后需要重启服务，可使用上述停止、启动流程。健康检查正常不代表主机密钥策略符合预期，仍需核对第 8 节日志。
 
-SSH 执行强制启用 `StrictHostKeyChecking=yes`。`conf/known_hosts` 必须按执行节点单独维护，不能直接复制开发人员的 `~/.ssh/known_hosts`，也不能提交真实主机公钥到仓库。
+## 6. SSH / SFTP 主机密钥校验
+
+SSH 命令（`server_command`）和 SFTP 上传（`server_file_upload`）共用同一项配置。
+未在 YAML 或 JVM 中设置时，代码回退值为 `skip-host-key-check: false`，即 `StrictHostKeyChecking=yes`；实际策略取决于加载的配置，生产环境必须强制校验。
+只有受控隔离测试环境可以显式设为 `true`，配置方式见第 7.1 节。
+
+严格校验时，`conf/known_hosts` 必须存在并包含目标主机已核对的公钥。该文件按执行节点单独维护，不能直接复制开发人员的 `~/.ssh/known_hosts`，也不能提交真实主机公钥到仓库。
 
 Windows 先扫描候选指纹：
 
@@ -391,6 +465,7 @@ sudo chmod 0640 /data/sakura/sakura-admin/docker/sakura-execution-agent/conf/kno
 Linux 未安装 PowerShell Core 时，任务以错误码 `SSH_PWSH_NOT_INSTALLED` 失败。Agent 日志依次记录 `SSH_PWSH_CHECK_STARTED`，以及 `SSH_PWSH_AVAILABLE`、`SSH_PWSH_MISSING` 或 `SSH_PWSH_CHECK_FAILED`。日志不记录命令原文。
 
 ### 6.2 CentOS 7 安装 PowerShell 替换为阿里云镜像（国内速度快，推荐）
+
 ```bash
 # 1. 备份并创建新的 Base repo
 mkdir -p /etc/yum.repos.d/backup
@@ -409,14 +484,72 @@ pwsh --version
 
 ## 7. Agent 配置和接口
 
-### 7.1 Java 系统属性
+### 7.1 YAML 配置与 Java 系统属性
 
-| 属性 | 默认值 | 说明 |
+配置优先级为：**显式 JVM `-D` > YAML > 代码默认值**。配置只在 JVM 启动时加载，不支持热更新。
+Windows、Linux 安装器和 Docker 均显式加载安装目录的 YAML；手工启动未指定 `sakura.agent.config` 时，
+尝试读取工作目录下的 `conf/agent-config.yml`，仅在默认文件不存在时回退到代码默认值。显式指定的配置文件缺失或非法时拒绝启动。
+
+修改已安装 Agent 时，应编辑安装目录的 `conf/agent-config.yml`，不是源码目录的同名文件。
+例如 Windows 为 `D:\King\sakura\sakura-admin\docker\sakura-execution-agent\conf\agent-config.yml`。
+重新安装默认保留现场 YAML，仅修改源码模板后再次安装不会自动覆盖现场值；需要替换时使用第 4、5 节的显式配置参数。
+
+下面是需要修改的字段片段，请保留现场 YAML 中的其他配置，不要用片段覆盖整个文件。
+
+生产环境强制校验（`false` 表示“不跳过”，不是“关闭校验”）：
+
+```yaml
+ssh:
+  skip-host-key-check: false
+  known-hosts: conf/known_hosts
+```
+
+仅受控隔离测试环境跳过服务器身份校验（`true` 对应 `StrictHostKeyChecking=no`）：
+
+```yaml
+ssh:
+  skip-host-key-check: true
+```
+
+编辑后重启对应的计划任务、systemd 服务或容器，再核对 `AGENT_STARTED` 和任务日志中的生效值。
+虽然运行时设为 `true` 不再读取 `known_hosts`，当前 Windows/Linux 安装器仍要求提供有主机公钥记录的 `known_hosts` 输入，不能省略安装准备。
+该开关不会解决网络不通、算法协商失败或账号密码错误。
+
+手工启动时可使用以下独立示例。先配置与 Admin 一致的 `SAKURA_AGENT_TOKEN` 环境变量，在包含 JAR 的工作目录执行；
+所有 `-D` 参数必须放在 `-jar` 前面，修改手工命令不会改变已经运行的服务：
+
+```bash
+# 受控隔离测试环境临时覆盖 YAML，跳过校验
+java -Dsakura.agent.ssh-skip-host-key-check=true -jar sakura-execution-agent.jar
+
+# 强制校验，并使用已带外核对的主机公钥文件
+java -Dsakura.agent.ssh-skip-host-key-check=false \
+  -Dsakura.agent.known-hosts=/etc/sakura/known_hosts \
+  -jar sakura-execution-agent.jar
+
+# 改为加载其他 YAML 配置文件
+java -Dsakura.agent.config=/path/to/custom-config.yml -jar sakura-execution-agent.jar
+```
+
+配置文件路径与 YAML 中的相对路径均按 Agent 工作目录解析，不是按 YAML 文件所在目录解析。
+`agent-config.production.yml` 中的 `/etc`、`/opt`、`/data` 等绝对路径是 Linux 示例，使用前需调整为实际节点或容器挂载路径，不能直接照搬到 Windows。
+未知字段、重复键、显式空值、非法布尔值或多段 YAML 文档会被拒绝。旧模板中的空 `runtime-properties:` 应改为 `runtime-properties: {}`；
+不需要额外文件授权时使用 `allow-roots: []`，workspace 自动授权；额外授权目录必须已存在，不能是磁盘根、用户主目录或符号链接。
+
+安装入口将 bind 固定为 `127.0.0.1`，端口由安装参数指定；Windows 为兼容既有任务恢复，仍将账本固定为
+`<InstallRoot>\workspace\task-ledger.json`，这三项对应的 JVM 参数优先于 YAML。
+其余已支持的 YAML 路径由 Java 统一解析；Windows 启动脚本不再强制要求默认 `drivers/known_hosts/workspace` 存在，但自定义目录的权限仍需提前配置。
+
+下表列出代码回退默认值，不表示某份源码或现场 YAML 当前一定使用这些值；有效配置以启动日志为准。
+
+| 属性 | 代码默认值 | 说明 |
 | --- | --- | --- |
 | `sakura.agent.bind` | `127.0.0.1` | 监听地址，生产禁止改为公网地址 |
 | `sakura.agent.port` | `19091` | 本机 HTTP 端口 |
 | `sakura.agent.driver-dir` | `drivers` | JDBC profile 根目录 |
-| `sakura.agent.known-hosts` | `known_hosts` | SSH 主机公钥文件 |
+| `sakura.agent.config` | `conf/agent-config.yml` | YAML 路径；显式指定的文件缺失或非法时拒绝启动 |
+| `sakura.agent.ssh-skip-host-key-check` | `false` | `false` 强制校验，`true` 跳过校验；SSH/SFTP 共用，生产必须为 `false` |
+| `sakura.agent.known-hosts` | `conf/known_hosts` | SSH/SFTP 共用的主机公钥文件 |
 | `sakura.agent.log-file` | `logs/agent.log` | 结构化诊断日志 |
 
 ### 7.2 HTTP 接口
@@ -437,21 +570,22 @@ Authorization: Bearer <SAKURA_AGENT_TOKEN>
 任务类型：
 
 ```text
-server_command   SSH 服务器命令
-database_sql     JDBC SQL（query/update/call）
-database_native  MongoDB 原生操作
+server_command      SSH 服务器命令
+server_file_upload  SFTP 文件上传
+database_sql        JDBC SQL（query/update/call）
+database_native     MongoDB 原生操作
 ```
 
 Agent 只接受 Admin 已经解析和授权的任务。浏览器或扩展不应直接调用这些接口。
 
 ## 8. 日志和故障排查
 
-日志位置：
+默认日志位置如下；若 YAML 的 `logging.file` 或 JVM 的 `sakura.agent.log-file` 已覆盖路径，以启动日志中的 `logFile` 为准：
 
 | 系统 | Agent 日志 | 服务日志 |
 | --- | --- | --- |
 | Windows | `D:\King\sakura\sakura-admin\docker\sakura-execution-agent\logs\agent.log` | 计划任务/启动窗口输出 |
-| Linux systemd | 由 journald 统一收集标准输出 | `journalctl -u sakura-execution-agent` |
+| Linux systemd | `<InstallRoot>/logs/agent.log` | `journalctl -u sakura-execution-agent` |
 
 查看最近日志：
 
@@ -463,17 +597,49 @@ Get-Content 'D:\King\sakura\sakura-admin\docker\sakura-execution-agent\logs\agen
 sudo journalctl -u sakura-execution-agent -n 200 --no-pager
 ```
 
-Linux 手工启动时如果配置了 `-Dsakura.agent.log-file=/可写目录/agent.log`，Agent 还会写入指定文件；systemd 默认以 journald 为准。
+Agent 同时输出诊断日志到文件和标准输出/错误输出，systemd 会通过 journald 收集控制台日志；自定义日志目录需允许服务账号写入。
 
 日志会记录任务 ID、操作类型、驱动 profile、端点主机/端口/库名、驱动版本、超时、SQLState 和错误码。密码、Token、连接串密码、SQL 原文和参数值不会写入日志。
 
-常见问题：
+### 8.1 确认主机密钥配置是否生效
+
+先定位重启后最新的 `AGENT_STARTED`，核对实际配置文件、是否成功加载以及最终开关值：
+
+```text
+AGENT_STARTED ... configFile=.../conf/agent-config.yml configLoaded=true sshSkipHostKeyCheck=false knownHosts=.../conf/known_hosts
+```
+
+`sshSkipHostKeyCheck=false` 表示强制校验；只有 `true` 才表示跳过。这里记录的是合并 JVM 参数后的有效值，不能仅凭 YAML 内容或 `/health` 判断。
+手工启动时出现 `configLoaded=false` 说明没有加载默认 YAML；通过安装入口显式指定文件时，文件缺失应直接启动失败。
+
+然后触发一次 SSH 或 SFTP 任务，按 taskId 核对同一次执行的策略日志。强制校验示例：
+
+```text
+SSH_KNOWN_HOSTS_VALIDATED taskId=xxx actionType=server_command file=/path/to/known_hosts strictHostKeyChecking=yes
+```
+
+SFTP 对应 `SFTP_KNOWN_HOSTS_VALIDATED`。该日志只表示主机公钥文件已加载并启用严格校验，不代表目标主机已经通过验证；远端公钥仍在连接时核对。
+
+跳过校验时会出现警告：
+
+```text
+SSH_HOST_KEY_CHECK_DISABLED taskId=xxx actionType=server_command host=192.168.1.100 strictHostKeyChecking=no reason=sakura.agent.ssh-skip-host-key-check=true
+SFTP_HOST_KEY_CHECK_DISABLED taskId=xxx actionType=server_file_upload host=192.168.1.100 strictHostKeyChecking=no reason=sakura.agent.ssh-skip-host-key-check=true
+```
+
+上述两行分别对应 SSH 和 SFTP 任务，不要求同一个任务同时出现两行。即使已出现跳过校验日志，连接、算法协商和身份认证仍可能失败。
+
+### 8.2 常见问题
 
 | 现象 | 检查方向 |
 | --- | --- |
 | `/health` 不通 | Agent 是否启动、端口是否被占用、Java 是否为 17+ |
 | HTTP 401 | Admin 与 Agent Token 是否来自同一次安装；轮换后是否同时重启 Admin |
-| SSH 主机校验失败 | `known_hosts` 是否来自带外核对，目标主机指纹是否变化 |
+| SSH/SFTP 主机校验失败或 `reject HostKey` | 先查有效策略；严格模式下检查实际 `knownHosts` 文件是否包含目标主机/端口的已核对公钥，指纹是否变化 |
+| 配置 `false` 后仍校验 | 正常行为：`false` 是“不跳过”；只有受控隔离测试环境才可设为 `true` |
+| YAML 已为 `true`，仍未跳过 | 核对 `configFile` 是否指向安装目录、`configLoaded` 是否为 `true`、是否重启；检查 JVM `-D` 是否覆盖为 `false`，以及是否仍运行旧 JAR/旧进程；重装默认保留现场 YAML，不会自动采用源码改动 |
+| 启动日志是 `true`，任务仍报主机校验失败 | 按 taskId 核对是否来自同一节点、端口、进程和本次启动；查看对应的 `*_HOST_KEY_CHECK_DISABLED`，不要混用 Runner 历史日志与当前 Agent 日志 |
+| YAML 预检失败 | 检查未知字段、重复键、空值、布尔值和多段文档；旧模板用 `runtime-properties: {}`，额外授权目录需符合第 7.1 节规则 |
 | Linux PowerShell 执行失败 | 查看 `SSH_PWSH_*` 日志；未安装时安装 PowerShell Core，或把步骤 Shell 改为 `bash/sh` |
 | JDBC 驱动未找到 | `drivers/{profile}` 是否存在 JAR，profile 是否与 Admin 数据库类型映射一致 |
 | JDBC `42S22/1054` | 连接已建立，通常是 SQL 引用了不存在的列；检查日志中的 `UNKNOWN_COLUMN` |
@@ -485,18 +651,33 @@ Linux 手工启动时如果配置了 `-Dsakura.agent.log-file=/可写目录/agen
 - Agent 仅监听 `127.0.0.1`，禁止暴露到公网或办公网。
 - Token 使用随机值；禁止使用数据库密码、SSH 密码或 Admin 登录密码代替。
 - Windows Token 文件由 ACL 保护，Linux Token 文件权限为 `0600`；不要把 `agent.env` 提交到 Git。
-- `known_hosts` 必须带外确认，禁止关闭主机指纹校验。
+- 生产环境必须使用 `skip-host-key-check: false`，`known_hosts` 中的目标主机公钥必须带外确认。
+- 跳过校验仅限受控隔离测试环境，会失去服务器身份校验和相应的中间人攻击防护；结合网络隔离、防火墙或 VPN，测试后恢复严格校验。不能用该开关绕过网络、算法或账号认证问题。
 - JDBC 和 MongoDB 凭据由 Admin 运行时解析，不写入场景步骤或公共任务响应。
 - 只给数据库账号授予验收所需的最小查询/DML 权限。
 - 生产升级前保留旧 JAR、驱动清单和日志备份；不要删除整个安装目录回滚。
 
 ## 10. 发布验收清单
 
-### 静态验收
+### 构建与回归验证
 
 ```powershell
-mvn -DskipTests package
+mvn -B test package
+.\src\test\powershell\AgentConfiguration.Tests.ps1
 Get-FileHash .\target\sakura-execution-agent-0.1.0-SNAPSHOT.jar -Algorithm SHA256
+```
+
+Java 测试覆盖三份 YAML 模板、配置优先级、非法 YAML、路径映射、OCR 开关，以及 SSH/SFTP 的主机密钥策略。
+Linux 同样执行 `mvn -B test package`；PowerShell 脚本仅在 Windows 执行，默认使用 Windows PowerShell 5.1，
+读取构建产物 `target\sakura-execution-agent-0.1.0-SNAPSHOT.jar` 和本机 `conf\known_hosts`，
+只在随机临时目录和空闲回环端口启动测试实例，不安装服务、不操作现有计划任务，也不连接 SSH。
+模板回归以默认/生产模板为 `false`、开发模板为 `true` 为基线；若源码模板已按现场需求改为 `true`，应在保留标准模板的独立测试副本运行，不要为测试覆盖已安装节点配置。
+
+需要验证 PowerShell 7 兼容性时，通过完整可执行路径指定测试 Shell（其他节点请替换为实际路径）：
+
+```powershell
+.\src\test\powershell\AgentConfiguration.Tests.ps1 `
+  -ShellPath 'D:\Program\PowerShell\PowerShell-7.6.3-win-x64\pwsh.exe'
 ```
 
 ### 节点验收
@@ -507,6 +688,8 @@ Get-FileHash .\target\sakura-execution-agent-0.1.0-SNAPSHOT.jar -Algorithm SHA25
 - [ ] 错误 Token 返回 HTTP 401；
 - [ ] 所需 JDBC profile 均有 JAR；
 - [ ] `known_hosts` 非空且经过带外确认；
+- [ ] `AGENT_STARTED` 中 `configFile` 指向预期 YAML，`configLoaded=true`，`sshSkipHostKeyCheck` 符合环境要求（生产必须为 `false`）；
+- [ ] 修改 YAML 后已重启，真实 SSH/SFTP 任务的 `strictHostKeyChecking=yes/no` 与预期一致，而不是只看 `/health`；
 - [ ] Agent 运行账号不是 root/Administrator；
 - [ ] 日志可以按 taskId 定位一次执行；
 - [ ] Admin 使用与 Agent 相同的 Token。
@@ -521,5 +704,7 @@ Get-FileHash .\target\sakura-execution-agent-0.1.0-SNAPSHOT.jar -Algorithm SHA25
 4. 一次错误 SQL，确认任务进入 `failed` 且不死循环；
 5. 一次取消任务，确认 Agent 释放连接或 SSH 通道；
 6. MongoDB `database_native`（如果项目启用 MongoDB）。
+
+启用文件上传时，再执行一次 SFTP `server_file_upload` 并核对目标文件；严格校验环境还应确认未信任或公钥变化的目标主机被拒绝。
 
 没有实际厂商数据库环境时，只能声明 Agent 构建和链路验收通过，不能声称全部数据库已完成真实兼容认证。

@@ -8,6 +8,8 @@ DEFAULT_INSTALL_ROOT="${WORKSPACE_ROOT}/sakura-admin/docker/sakura-execution-age
 INSTALL_ROOT="${INSTALL_ROOT:-}"
 ENV_ROOT="${ENV_ROOT:-}"
 AGENT_JAR="${SOURCE_ROOT}/target/sakura-execution-agent-0.1.0-SNAPSHOT.jar"
+AGENT_CONFIG="${SOURCE_ROOT}/conf/agent-config.yml"
+AGENT_CONFIG_EXPLICIT="false"
 KNOWN_HOSTS="${SOURCE_ROOT}/conf/known_hosts"
 PROFILES=""
 PORT="19091"
@@ -24,6 +26,7 @@ usage() {
 用法：bash scripts/install-agent.sh [选项]
   --install-root PATH   安装目录，默认 ${DEFAULT_INSTALL_ROOT}
   --agent-jar PATH      Agent JAR
+  --agent-config PATH   显式替换 YAML；未指定时保留安装目录中的现有配置
   --known-hosts PATH    已带外确认的 known_hosts
   --env-root PATH       环境文件目录，或以 .env 结尾的环境文件路径，默认 ${DEFAULT_INSTALL_ROOT}/conf/agent.env
   --profiles CSV        需要部署的 JDBC profile，例如 mysql,postgresql
@@ -40,6 +43,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --install-root) INSTALL_ROOT="$2"; shift 2 ;;
     --agent-jar) AGENT_JAR="$2"; shift 2 ;;
+    --agent-config) AGENT_CONFIG="$2"; AGENT_CONFIG_EXPLICIT="true"; shift 2 ;;
     --known-hosts) KNOWN_HOSTS="$2"; shift 2 ;;
     --env-root) ENV_ROOT="$2"; shift 2 ;;
     --profiles) PROFILES="$2"; shift 2 ;;
@@ -62,6 +66,18 @@ if [[ "$INSTALL_ROOT" != /* ]]; then
   INSTALL_ROOT="$PWD/$INSTALL_ROOT"
 fi
 INSTALL_ROOT="$(realpath -m -- "$INSTALL_ROOT")"
+AGENT_JAR="$(realpath -m -- "$AGENT_JAR")"
+CONFIG_TARGET="${INSTALL_ROOT}/conf/agent-config.yml"
+CONFIG_ACTION="首次复制"
+if [[ -f "$CONFIG_TARGET" ]]; then
+  if [[ "$AGENT_CONFIG_EXPLICIT" == "true" ]]; then
+    CONFIG_ACTION="显式替换"
+  else
+    AGENT_CONFIG="$CONFIG_TARGET"
+    CONFIG_ACTION="保留现场配置"
+  fi
+fi
+AGENT_CONFIG="$(realpath -m -- "$AGENT_CONFIG")"
 if [[ "$ENV_ROOT" != /* ]]; then
   ENV_ROOT="$PWD/$ENV_ROOT"
 fi
@@ -77,6 +93,7 @@ fi
 [[ "$INSTALL_ROOT" != *[[:space:]]* ]] || { echo 'install-root 不能包含空白字符' >&2; exit 1; }
 [[ "$ENV_ROOT" != *[[:space:]]* && "$ENV_FILE" != *[[:space:]]* ]] || { echo '环境文件路径不能包含空白字符' >&2; exit 1; }
 [[ -f "$AGENT_JAR" ]] || { echo "Agent JAR 不存在：$AGENT_JAR" >&2; exit 1; }
+[[ -f "$AGENT_CONFIG" ]] || { echo "Agent YAML 不存在：$AGENT_CONFIG" >&2; exit 1; }
 [[ -s "$KNOWN_HOSTS" ]] || { echo "known_hosts 不存在或为空：$KNOWN_HOSTS" >&2; exit 1; }
 grep -Eq '^[[:space:]]*[^#[:space:]]' "$KNOWN_HOSTS" || { echo "known_hosts 没有主机公钥记录：$KNOWN_HOSTS" >&2; exit 1; }
 [[ "$PORT" =~ ^[0-9]+$ ]] && (( PORT >= 1 && PORT <= 65535 )) || { echo '端口必须在 1-65535 之间' >&2; exit 1; }
@@ -153,6 +170,10 @@ for profile in "${PROFILE_LIST[@]}"; do
   compgen -G "${profile_dir}/*.jar" >/dev/null || { echo "驱动 profile 没有 JAR：$profile" >&2; exit 1; }
 done
 
+# 预检不绑定端口、不读取 Token、不创建目录，必须在停止旧服务之前成功。
+"$JAVA_BIN" "-Dsakura.agent.config=$AGENT_CONFIG" -Dsakura.agent.bind=127.0.0.1 "-Dsakura.agent.port=$PORT" \
+  -cp "$AGENT_JAR" top.continew.sakura.agent.config.AgentConfiguration "$INSTALL_ROOT"
+printf '配置：%s（%s）\n' "$AGENT_CONFIG" "$CONFIG_ACTION"
 printf '安装目录：%s\nJAR：%s\nknown_hosts：%s\n环境文件：%s\nprofiles：%s\nJava：%s\n端口：%s\n' \
   "$INSTALL_ROOT" "$AGENT_JAR" "$KNOWN_HOSTS" "$ENV_FILE" "${PROFILES:-无外置 JDBC 驱动}" "$JAVA_BIN" "$PORT"
 if [[ "$PLAN_ONLY" = "true" ]]; then
@@ -180,8 +201,18 @@ install -d -o root -g "$SERVICE_GROUP" -m 0750 "$INSTALL_ROOT" "$INSTALL_ROOT/dr
 # Agent 账号只对日志、workspace 和账本目录可写，安装根、驱动和 known_hosts 保持不可写。
 install -d -o "$SERVICE_USER" -g "$SERVICE_GROUP" -m 0750 \
   "$INSTALL_ROOT/logs" "$INSTALL_ROOT/workspace" "$INSTALL_ROOT/data"
-install -d -o root -g root -m 0700 "$ENV_ROOT"
+# 默认 agent.env 与 YAML/known_hosts 共用 conf，不能把该目录改成服务账号不可遍历的 0700。
+# Token 文件自身仍为 root:root 0600，由 systemd 读取后注入环境。
+if [[ "$ENV_ROOT" != "$INSTALL_ROOT/conf" ]]; then
+  install -d -o root -g root -m 0700 "$ENV_ROOT"
+fi
 install -o root -g "$SERVICE_GROUP" -m 0750 "$AGENT_JAR" "$INSTALL_ROOT/sakura-execution-agent.jar"
+if [[ "$AGENT_CONFIG" -ef "$CONFIG_TARGET" ]]; then
+  chown root:"$SERVICE_GROUP" "$CONFIG_TARGET"
+  chmod 0640 "$CONFIG_TARGET"
+else
+  install -o root -g "$SERVICE_GROUP" -m 0640 "$AGENT_CONFIG" "$CONFIG_TARGET"
+fi
 known_hosts_target="$INSTALL_ROOT/conf/known_hosts"
 if [[ "$KNOWN_HOSTS" -ef "$known_hosts_target" ]]; then
   # 源码目录与安装目录相同时，known_hosts 已经是目标文件，只调整权限，不能复制自身。
@@ -232,7 +263,7 @@ User=${SERVICE_USER}
 Group=${SERVICE_GROUP}
 WorkingDirectory=${INSTALL_ROOT}
 EnvironmentFile=${ENV_FILE}
-ExecStart=${JAVA_BIN} -Dsakura.agent.bind=127.0.0.1 -Dsakura.agent.port=${PORT} -Dsakura.agent.driver-dir=${INSTALL_ROOT}/drivers -Dsakura.agent.known-hosts=${INSTALL_ROOT}/conf/known_hosts -Dsakura.agent.log-file=${INSTALL_ROOT}/logs/agent.log -Dsakura.agent.workspace=${INSTALL_ROOT}/workspace -Dsakura.agent.ledger-file=${INSTALL_ROOT}/data/task-ledger.json -jar ${INSTALL_ROOT}/sakura-execution-agent.jar
+ExecStart=${JAVA_BIN} -Dsakura.agent.config=${CONFIG_TARGET} -Dsakura.agent.bind=127.0.0.1 -Dsakura.agent.port=${PORT} -jar ${INSTALL_ROOT}/sakura-execution-agent.jar
 Restart=on-failure
 RestartSec=5
 NoNewPrivileges=true

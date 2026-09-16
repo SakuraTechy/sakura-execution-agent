@@ -4,6 +4,8 @@ param(
 
     [string]$AgentJarPath = '',
 
+    [string]$AgentConfigPath = '',
+
     [string]$KnownHostsPath = '',
 
     [ValidateSet(
@@ -29,8 +31,12 @@ param(
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Security
 $sourceRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+$agentConfigPathExplicit = -not [string]::IsNullOrWhiteSpace($AgentConfigPath)
 if ([string]::IsNullOrWhiteSpace($AgentJarPath)) {
     $AgentJarPath = Join-Path $sourceRoot 'target\sakura-execution-agent-0.1.0-SNAPSHOT.jar'
+}
+if ([string]::IsNullOrWhiteSpace($AgentConfigPath)) {
+    $AgentConfigPath = Join-Path $sourceRoot 'conf\agent-config.yml'
 }
 if ([string]::IsNullOrWhiteSpace($KnownHostsPath)) {
     $KnownHostsPath = Join-Path $sourceRoot 'conf\known_hosts'
@@ -39,6 +45,17 @@ $agentJar = (Resolve-Path -LiteralPath $AgentJarPath).Path
 $knownHosts = (Resolve-Path -LiteralPath $KnownHostsPath).Path
 $installPath = [IO.Path]::GetFullPath($InstallRoot)
 $installDriveRoot = [IO.Path]::GetPathRoot($installPath)
+$installedConfigPath = Join-Path $installPath 'conf\agent-config.yml'
+$configAction = '首次复制'
+if (Test-Path -LiteralPath $installedConfigPath -PathType Leaf) {
+    if ($agentConfigPathExplicit) {
+        $configAction = '显式替换'
+    } else {
+        $AgentConfigPath = $installedConfigPath
+        $configAction = '保留现场配置'
+    }
+}
+$agentConfig = (Resolve-Path -LiteralPath $AgentConfigPath).Path
 
 if ($installPath.TrimEnd('\') -eq $installDriveRoot.TrimEnd('\')) {
     throw 'InstallRoot 不能是磁盘根目录。'
@@ -55,10 +72,14 @@ if ($knownHostEntries.Count -eq 0) {
 
 $java = Get-Command $JavaCommand -ErrorAction Stop
 $savedErrorActionPreference = $ErrorActionPreference
-$ErrorActionPreference = 'Continue'
-$javaVersionText = (& $java.Source -version 2>&1 | Out-String)
-$javaExitCode = $LASTEXITCODE
-$ErrorActionPreference = $savedErrorActionPreference
+try {
+    $ErrorActionPreference = 'Continue'
+    # Windows PowerShell 会把原生 stderr 包装为 ErrorRecord，先转文本以免正常提示被格式化成错误。
+    $javaVersionText = (& $java.Source -version 2>&1 | ForEach-Object { $_.ToString() } | Out-String)
+    $javaExitCode = $LASTEXITCODE
+} finally {
+    $ErrorActionPreference = $savedErrorActionPreference
+}
 if ($javaExitCode -ne 0) {
     throw "Java 版本检查失败：$javaVersionText"
 }
@@ -79,9 +100,30 @@ foreach ($profile in $Profiles) {
     }
 }
 
+# PlanOnly 同样运行只读预检；不读取 Token、不建目录，也不停止现有进程。
+$configCheckArguments = @(
+    "-Dsakura.agent.config=$agentConfig", '-Dsakura.agent.bind=127.0.0.1', "-Dsakura.agent.port=$Port",
+    "-Dsakura.agent.ledger-file=$(Join-Path $installPath 'workspace\task-ledger.json')",
+    '-cp', $agentJar, 'top.continew.sakura.agent.config.AgentConfiguration', $installPath
+)
+$savedErrorActionPreference = $ErrorActionPreference
+try {
+    $ErrorActionPreference = 'Continue'
+    $configCheckOutput = (& $java.Source @configCheckArguments 2>&1 | ForEach-Object { $_.ToString() } | Out-String)
+    $configCheckExitCode = $LASTEXITCODE
+} finally {
+    $ErrorActionPreference = $savedErrorActionPreference
+}
+if ($configCheckExitCode -ne 0) {
+    throw "Agent 配置预检失败，未停止旧 Agent。请确认已重新构建 JAR。`n$configCheckOutput"
+}
+Write-Host $configCheckOutput.Trim()
+
 $plan = [pscustomobject]@{
     InstallRoot = $installPath
     AgentJar = $agentJar
+    AgentConfig = $agentConfig
+    AgentConfigAction = $configAction
     KnownHosts = $knownHosts
     Profiles = @($Profiles)
     Java = $java.Source
@@ -237,7 +279,13 @@ Grant-DirectoryModify -Path (Join-Path $installPath 'logs') -SidValue 'S-1-5-19'
 # 计划任务默认工作目录是 System32，必须给 Agent 指定可写的专用 workspace。
 Grant-DirectoryModify -Path $workspacePath -SidValue 'S-1-5-19'
 Copy-Item -LiteralPath $agentJar -Destination (Join-Path $installPath 'sakura-execution-agent.jar') -Force
-Copy-Item -LiteralPath $knownHosts -Destination (Join-Path $installPath 'conf\known_hosts') -Force
+if (-not [string]::Equals($agentConfig, $installedConfigPath, [StringComparison]::OrdinalIgnoreCase)) {
+    Copy-Item -LiteralPath $agentConfig -Destination $installedConfigPath -Force
+}
+$installedKnownHostsPath = Join-Path $installPath 'conf\known_hosts'
+if (-not [string]::Equals($knownHosts, $installedKnownHostsPath, [StringComparison]::OrdinalIgnoreCase)) {
+    Copy-Item -LiteralPath $knownHosts -Destination $installedKnownHostsPath -Force
+}
 Copy-WindowsPowerShellScript -Source (Join-Path $PSScriptRoot 'run-installed-agent.ps1') -Destination (Join-Path $installPath 'run-agent.ps1')
 Copy-WindowsPowerShellScript -Source (Join-Path $PSScriptRoot 'check-agent.ps1') -Destination (Join-Path $installPath 'check-agent.ps1')
 Copy-WindowsPowerShellScript -Source (Join-Path $PSScriptRoot 'stop-agent.ps1') -Destination (Join-Path $installPath 'stop-agent.ps1')
@@ -298,7 +346,7 @@ if (-not $SkipTaskRegistration) {
     }
     $runnerPath = Join-Path $installPath 'run-agent.ps1'
     $taskArguments = "-NoProfile -ExecutionPolicy Bypass -File `"$runnerPath`" -InstallRoot `"$installPath`" -Port $Port -JavaCommand `"$($java.Source)`""
-    $action = New-ScheduledTaskAction -Execute "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -Argument $taskArguments
+    $action = New-ScheduledTaskAction -Execute "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -Argument $taskArguments -WorkingDirectory $installPath
     $trigger = New-ScheduledTaskTrigger -AtStartup
     $taskPrincipal = New-ScheduledTaskPrincipal -UserId 'NT AUTHORITY\LOCAL SERVICE' -LogonType ServiceAccount
     $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit ([TimeSpan]::Zero)

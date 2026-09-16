@@ -175,6 +175,10 @@ public class InfrastructureTaskService implements AutoCloseable {
                                                 Instant startedAt,
                                                 Instant finishedAt) {
         Map<String, Object> result = outcome == null ? new java.util.LinkedHashMap<>() : new java.util.LinkedHashMap<>(outcome.result());
+        if ("server_command".equals(request.actionType()) && !"passed".equals(status)) {
+            // 取消与完成可能竞争，非成功终态不能发布已计算的变量候选。
+            result.remove("variables");
+        }
         result.put("infrastructure", infrastructureResult(request, status, durationMs, exitCode, affectedRows, outcome,
             error));
         return new InfrastructureTaskResponse(request.taskId(), status, request.actionType(), durationMs, exitCode,

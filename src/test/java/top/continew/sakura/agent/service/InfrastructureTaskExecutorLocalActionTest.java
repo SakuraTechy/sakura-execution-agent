@@ -4,6 +4,8 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Instant;
@@ -74,6 +76,19 @@ class InfrastructureTaskExecutorLocalActionTest {
     }
 
     @Test
+    void availableIpPrefixAcceptsOneLegacyTrailingDotButNotAFullIp() throws Exception {
+        assertEquals("172.19.5", validatePrivateIpv4Prefix("172.19.5."));
+
+        InvocationTargetException fullIpFailure = assertThrows(InvocationTargetException.class,
+            () -> validatePrivateIpv4Prefix("172.19.5.51"));
+        assertEquals("AVAILABLE_IP_PREFIX_INVALID", ((AgentExecutionException)fullIpFailure.getCause()).errorCode());
+
+        InvocationTargetException doubleDotFailure = assertThrows(InvocationTargetException.class,
+            () -> validatePrivateIpv4Prefix("172.19.5.."));
+        assertEquals("AVAILABLE_IP_PREFIX_INVALID", ((AgentExecutionException)doubleDotFailure.getCause()).errorCode());
+    }
+
+    @Test
     void captchaOcrRequiresNodeConfiguredCommandBeforeProcessingImage() {
         String pythonKey = "sakura.agent.captcha-ocr-python";
         String scriptKey = "sakura.agent.captcha-ocr-script";
@@ -87,6 +102,30 @@ class InfrastructureTaskExecutorLocalActionTest {
                     "variableName", "captchaValue", "captchaImageBase64", "AQ==", "capability", "captcha_ocr"))));
             assertEquals("CAPTCHA_OCR_NOT_CONFIGURED", missingConfiguration.errorCode());
         } finally {
+            restoreProperty(pythonKey, previousPython);
+            restoreProperty(scriptKey, previousScript);
+        }
+    }
+
+    @Test
+    void captchaOcrExplicitlyDisabledEvenWhenInterpreterAndScriptAreConfigured() throws Exception {
+        String enabledKey = "sakura.agent.captcha-ocr-enabled";
+        String pythonKey = "sakura.agent.captcha-ocr-python";
+        String scriptKey = "sakura.agent.captcha-ocr-script";
+        String previousEnabled = System.getProperty(enabledKey);
+        String previousPython = System.getProperty(pythonKey);
+        String previousScript = System.getProperty(scriptKey);
+        try {
+            System.setProperty(enabledKey, "false");
+            System.setProperty(pythonKey, "python");
+            System.setProperty(scriptKey, Files.writeString(workspace.resolve("ocr.py"), "raise Exception()").toString());
+            AgentExecutionException disabled = assertThrows(AgentExecutionException.class,
+                () -> executor.execute(request(Map.of("taskId", "captcha-disabled", "actionType", "captcha_ocr",
+                    "variableName", "captchaValue", "captchaImageBase64", "AQ==", "capability", "captcha_ocr"))));
+            assertEquals("CAPTCHA_OCR_DISABLED", disabled.errorCode());
+            assertFalse(new LocalActionPolicy(workspace, List.of()).hasCaptchaOcrConfiguration());
+        } finally {
+            restoreProperty(enabledKey, previousEnabled);
             restoreProperty(pythonKey, previousPython);
             restoreProperty(scriptKey, previousScript);
         }
@@ -133,6 +172,12 @@ class InfrastructureTaskExecutorLocalActionTest {
 
     private InfrastructureTaskRequest request(Map<String, Object> fields) {
         return objectMapper.convertValue(fields, InfrastructureTaskRequest.class);
+    }
+
+    private String validatePrivateIpv4Prefix(String value) throws Exception {
+        Method method = InfrastructureTaskExecutor.class.getDeclaredMethod("validatePrivateIpv4Prefix", String.class);
+        method.setAccessible(true);
+        return (String)method.invoke(executor, value);
     }
 
     private void restoreProperty(String key, String value) {
