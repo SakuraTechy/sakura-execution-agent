@@ -264,7 +264,8 @@ public class InfrastructureTaskExecutor {
             logger.info("JDBC_CONNECTION_OPENED", request.taskId(), request.actionType(), "driver=" + connection.getMetaData()
                 .getDriverName() + " driverVersion=" + connection.getMetaData().getDriverVersion());
             String sqlMode = normalizeSqlMode(request.sqlMode());
-            boolean readOnlyTransaction = "query".equals(sqlMode);
+            boolean readOnlyTransaction = "query".equals(sqlMode)
+                || ("script".equals(sqlMode) && "read".equalsIgnoreCase(request.riskLevel()));
             if (readOnlyTransaction) {
                 if (!Boolean.TRUE.equals(request.readOnlyEnforced())) {
                     throw new AgentExecutionException("JDBC_READ_ONLY_REQUIRED", "query 模式必须由 Admin 强制只读事务");
@@ -274,6 +275,17 @@ public class InfrastructureTaskExecutor {
                 connection.setAutoCommit(false);
             }
             try {
+                if ("script".equals(sqlMode)) {
+                    if (request.parameters() != null && !request.parameters().isEmpty()) {
+                        throw new IllegalArgumentException("script 模式暂不支持 JDBC 参数；请拆分为多个参数化步骤");
+                    }
+                    ExecutionOutcome outcome = executeScript(connection, request, startedAt);
+                    outcome = bindQueryResultIfRequested(request, outcome);
+                    logger.info("JDBC_SCRIPT_COMPLETED", request.taskId(), request.actionType(), "durationMs="
+                        + outcome.durationMs() + " affectedRows=" + outcome.affectedRows() + " resultCount="
+                        + outcome.results().size());
+                    return outcome;
+                }
                 try (PreparedStatement statement = "call".equals(sqlMode)
                     ? connection.prepareCall(request.sql())
                     : connection.prepareStatement(request.sql())) {
@@ -289,7 +301,7 @@ public class InfrastructureTaskExecutor {
                         + queryTimeoutSeconds(request.timeoutMs()));
                     ExecutionOutcome outcome = switch (sqlMode) {
                         case "query" -> executeQuery(statement, startedAt, request.maxRows());
-                        case "update" -> outcome(startedAt, 0, statement.executeLargeUpdate(), null, "", "");
+                        case "update" -> outcome(startedAt, 0, executeUpdateCompatible(statement), null, "", "");
                         case "call" -> executeCall((CallableStatement)statement, request.parameters(), startedAt, request
                             .maxRows());
                         default -> throw new IllegalArgumentException("不支持的 sqlMode：" + request.sqlMode());
@@ -309,6 +321,18 @@ public class InfrastructureTaskExecutor {
                 logger.info("JDBC_DRIVER_RELEASED", request.taskId(), request.actionType(), "driverProfile=" + target
                     .driverProfile());
             }
+        }
+    }
+
+    /**
+     * JDBC 4.2 的大更新接口不是所有旧驱动都实现；Oracle ojdbc7 12.1 会直接抛出
+     * UnsupportedOperationException。先保留大更新能力，旧驱动再回退到兼容性更好的接口。
+     */
+    static long executeUpdateCompatible(PreparedStatement statement) throws SQLException {
+        try {
+            return statement.executeLargeUpdate();
+        } catch (UnsupportedOperationException ignored) {
+            return statement.executeUpdate();
         }
     }
 
@@ -1093,6 +1117,135 @@ public class InfrastructureTaskExecutor {
             return structuredOutcome(startedAt, 0, null, preview.legacyRows(), "", "", Map.of(), List
                 .of(preview.result()), sqlWarnings(statement.getWarnings()), preview.truncated(), preview.artifactResult());
         }
+    }
+
+    /**
+     * 脚本模式按顶层分号拆分后逐条执行，避免依赖 MySQL allowMultiQueries 等驱动私有开关。
+     * 每条语句的结果均保留在 MULTI_RESULT 中；脚本参数需拆成独立步骤，不能复用同一参数列表。
+     */
+    private ExecutionOutcome executeScript(Connection connection,
+                                           InfrastructureTaskRequest request,
+                                           Instant startedAt) throws SQLException {
+        List<String> statements = splitSqlStatements(request.sql());
+        if (statements.isEmpty()) {
+            throw new IllegalArgumentException("script 模式缺少可执行的 SQL 语句");
+        }
+        List<Map<String, Object>> results = new ArrayList<>();
+        List<Map<String, Object>> artifactResults = new ArrayList<>();
+        List<Map<String, Object>> firstRows = null;
+        Long affectedRows = null;
+        boolean truncated = false;
+        for (String sql : statements) {
+            try (Statement statement = connection.createStatement()) {
+                cancelActions.put(request.taskId(), () -> cancelStatement(statement, connection));
+                statement.setQueryTimeout(queryTimeoutSeconds(request.timeoutMs()));
+                statement.setMaxRows(MAX_ATTACHMENT_ROWS + 1);
+                boolean hasResultSet = statement.execute(sql);
+                while (true) {
+                    if (hasResultSet) {
+                        try (ResultSet resultSet = statement.getResultSet()) {
+                            ResultSetPreview preview = readResultSet(resultSet, request.maxRows());
+                            results.add(preview.result());
+                            artifactResults.add(preview.artifactResult());
+                            if (firstRows == null) firstRows = preview.legacyRows();
+                            truncated |= preview.truncated();
+                        }
+                    } else {
+                        long updateCount = statement.getLargeUpdateCount();
+                        if (updateCount == -1L) break;
+                        Map<String, Object> updateResult = updateCountResult(updateCount);
+                        results.add(updateResult);
+                        artifactResults.add(updateResult);
+                        affectedRows = affectedRows == null ? updateCount : Math.addExact(affectedRows, updateCount);
+                    }
+                    hasResultSet = statement.getMoreResults(Statement.CLOSE_CURRENT_RESULT);
+                }
+            }
+        }
+        Map<String, Object> artifact = new LinkedHashMap<>();
+        artifact.put("type", "MULTI_RESULT");
+        artifact.put("results", artifactResults);
+        artifact.put("statementCount", statements.size());
+        artifact.put("truncated", truncated);
+        return structuredOutcome(startedAt, 0, affectedRows, firstRows, "", "", Map.of(), results,
+            List.of(), truncated, artifact);
+    }
+
+    static List<String> splitSqlStatements(String sql) {
+        List<String> statements = new ArrayList<>();
+        String source = sql == null ? "" : sql;
+        StringBuilder current = new StringBuilder();
+        boolean singleQuote = false;
+        boolean doubleQuote = false;
+        boolean backtick = false;
+        boolean lineComment = false;
+        boolean blockComment = false;
+        for (int i = 0; i < source.length(); i++) {
+            char value = source.charAt(i);
+            char next = i + 1 < source.length() ? source.charAt(i + 1) : '\0';
+            if (lineComment) {
+                current.append(value);
+                if (value == '\n' || value == '\r') lineComment = false;
+                continue;
+            }
+            if (blockComment) {
+                current.append(value);
+                if (value == '*' && next == '/') {
+                    current.append(next);
+                    i++;
+                    blockComment = false;
+                }
+                continue;
+            }
+            if (!singleQuote && !doubleQuote && !backtick && value == '-' && next == '-') {
+                current.append(value).append(next);
+                i++;
+                lineComment = true;
+                continue;
+            }
+            if (!singleQuote && !doubleQuote && !backtick && value == '/' && next == '*') {
+                current.append(value).append(next);
+                i++;
+                blockComment = true;
+                continue;
+            }
+            if (!doubleQuote && !backtick && value == '\'') {
+                current.append(value);
+                if (singleQuote && next == '\'') {
+                    current.append(next);
+                    i++;
+                } else {
+                    singleQuote = !singleQuote;
+                }
+                continue;
+            }
+            if (!singleQuote && !backtick && value == '"') {
+                current.append(value);
+                doubleQuote = !doubleQuote;
+                continue;
+            }
+            if (!singleQuote && !doubleQuote && value == '`') {
+                current.append(value);
+                backtick = !backtick;
+                continue;
+            }
+            if (!singleQuote && !doubleQuote && !backtick && value == ';') {
+                addSqlStatement(statements, current);
+                current.setLength(0);
+                continue;
+            }
+            current.append(value);
+        }
+        if (singleQuote || doubleQuote || backtick || blockComment) {
+            throw new IllegalArgumentException("script 模式 SQL 引号或注释未闭合");
+        }
+        addSqlStatement(statements, current);
+        return statements;
+    }
+
+    private static void addSqlStatement(List<String> statements, StringBuilder sql) {
+        String value = sql.toString().trim();
+        if (!value.isEmpty()) statements.add(value);
     }
 
     private ExecutionOutcome executeCall(CallableStatement statement,

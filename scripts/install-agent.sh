@@ -223,6 +223,7 @@ else
 fi
 install -o root -g "$SERVICE_GROUP" -m 0750 "$SCRIPT_DIR/check-agent.sh" "$INSTALL_ROOT/check-agent.sh"
 install -o root -g "$SERVICE_GROUP" -m 0750 "$SCRIPT_DIR/stop-agent.sh" "$INSTALL_ROOT/stop-agent.sh"
+install -o root -g "$SERVICE_GROUP" -m 0750 "$SCRIPT_DIR/restart-agent.sh" "$INSTALL_ROOT/restart-agent.sh"
 
 for profile in "${PROFILE_LIST[@]}"; do
   [[ -z "$profile" ]] && continue

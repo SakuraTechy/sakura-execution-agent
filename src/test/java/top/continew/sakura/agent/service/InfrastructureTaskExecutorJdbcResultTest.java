@@ -3,8 +3,10 @@ package top.continew.sakura.agent.service;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 
+import java.lang.reflect.Proxy;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.sql.PreparedStatement;
 import java.util.List;
 import java.util.Map;
 
@@ -20,6 +22,59 @@ class InfrastructureTaskExecutorJdbcResultTest {
 
     @TempDir
     Path tempDirectory;
+
+    @Test
+    void updateFallsBackWhenDriverDoesNotImplementLargeUpdate() throws Exception {
+        PreparedStatement statement = (PreparedStatement)Proxy.newProxyInstance(
+            PreparedStatement.class.getClassLoader(),
+            new Class<?>[] {PreparedStatement.class},
+            (proxy, method, args) -> switch (method.getName()) {
+                case "executeLargeUpdate" -> throw new UnsupportedOperationException("executeLargeUpdate not implemented");
+                case "executeUpdate" -> 1;
+                default -> throw new UnsupportedOperationException("unexpected method: " + method.getName());
+            });
+
+        assertEquals(1L, InfrastructureTaskExecutor.executeUpdateCompatible(statement));
+    }
+
+    @Test
+    void scriptSplitterShouldKeepSemicolonsInsideQuotedValues() {
+        assertEquals(List.of("SELECT 'a;b'", "UPDATE test_user SET name = 'x;y'"),
+            InfrastructureTaskExecutor.splitSqlStatements("SELECT 'a;b'; UPDATE test_user SET name = 'x;y';"));
+    }
+
+    @Test
+    void scriptModeShouldExecuteMixedStatementsAndReturnAllResults() throws Exception {
+        Path driverRoot = Files.createDirectories(tempDirectory.resolve("script-drivers"));
+        Path profile = Files.createDirectories(driverRoot.resolve("h2"));
+        Path h2Jar = Path.of(Driver.class.getProtectionDomain().getCodeSource().getLocation().toURI());
+        Files.copy(h2Jar, profile.resolve("h2.jar"));
+        ObjectMapper objectMapper = new ObjectMapper();
+        InfrastructureTaskExecutor executor = new InfrastructureTaskExecutor(objectMapper, driverRoot,
+            new AgentLogger(tempDirectory.resolve("script-agent.log")), new LocalActionPolicy(tempDirectory.resolve(
+                "script-workspace"), List.of()));
+        InfrastructureTaskRequest request = objectMapper.convertValue(Map.of(
+            "taskId", "jdbc-script",
+            "actionType", "database_sql",
+            "sqlMode", "script",
+            "riskLevel", "write",
+            "approvalGranted", true,
+            "approvalId", "test-approval",
+            "approvalDigest", "0123456789012345678901234567890123456789012345678901234567890123",
+            "sql", "CREATE TABLE test_user(id INT, name VARCHAR(20)); INSERT INTO test_user VALUES (1, 'a'); SELECT * FROM test_user",
+            "maxRows", 10,
+            "jdbcTarget", Map.of(
+                "driverProfile", "h2",
+                "driverClass", "org.h2.Driver",
+                "jdbcUrl", "jdbc:h2:mem:script_result;DB_CLOSE_DELAY=-1")), InfrastructureTaskRequest.class);
+
+        InfrastructureTaskExecutor.ExecutionOutcome outcome = executor.execute(request);
+
+        assertEquals(3, outcome.results().size());
+        assertEquals(1L, outcome.affectedRows());
+        assertEquals("MULTI_RESULT", outcome.artifactResult().get("type"));
+        assertEquals(3, outcome.artifactResult().get("statementCount"));
+    }
 
     @Test
     void queryKeepsDuplicateLabelsColumnMetadataAndOrderedRows() throws Exception {

@@ -242,6 +242,7 @@ public class InfrastructureTaskService implements AutoCloseable {
             return switch (String.valueOf(request.sqlMode()).toLowerCase(java.util.Locale.ROOT)) {
                 case "update" -> "DATABASE_UPDATE";
                 case "call" -> "DATABASE_CALL";
+                case "script" -> "DATABASE_SCRIPT";
                 default -> "DATABASE_QUERY";
             };
         }

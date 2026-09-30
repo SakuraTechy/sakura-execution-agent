@@ -61,11 +61,13 @@ sakura-execution-agent/
 │  ├─ run-installed-agent.ps1     # Windows 计划任务运行模板
 │  ├─ update-known-hosts.ps1      # Windows 采集并写入 known_hosts
 │  ├─ stop-agent.ps1
+│  ├─ restart-agent.ps1
 │  ├─ check-agent.ps1
 │  ├─ build-drivers.sh            # Linux JDBC 驱动组装
 │  ├─ install-agent.sh            # Linux 部署/升级
 │  ├─ update-known-hosts.sh       # Linux 采集并写入 known_hosts
 │  ├─ stop-agent.sh
+│  ├─ restart-agent.sh
 │  └─ check-agent.sh
 ├─ src/
 ├─ pom.xml                        # Agent 本体、MongoDB Driver
@@ -273,14 +275,20 @@ automation:
 ### 4.4 停止、启动和验收
 
 ```powershell
+# 推荐：重启并等待健康检查通过
+& 'D:\King\sakura\sakura-admin\docker\sakura-execution-agent\restart-agent.ps1' `
+    -InstallRoot 'D:\King\sakura\sakura-admin\docker\sakura-execution-agent'
+
 # 停止
-& 'D:\King\sakura\sakura-admin\docker\sakura-execution-agent\stop-agent.ps1'
+& 'D:\King\sakura\sakura-admin\docker\sakura-execution-agent\stop-agent.ps1' `
+    -InstallRoot 'D:\King\sakura\sakura-admin\docker\sakura-execution-agent'
 
 # 启动
 Start-ScheduledTask -TaskName 'SakuraExecutionAgent'
 
 # 验收
-& 'D:\King\sakura\sakura-admin\docker\sakura-execution-agent\check-agent.ps1'
+& 'D:\King\sakura\sakura-admin\docker\sakura-execution-agent\check-agent.ps1' `
+    -InstallRoot 'D:\King\sakura\sakura-admin\docker\sakura-execution-agent'
 ```
 
 停止脚本只匹配当前安装目录的 Agent，不会按端口误杀其他 Java 进程。若 `19091` 仍被其他程序占用，脚本会报告 PID 并退出。
@@ -371,6 +379,9 @@ sudo awk -F= '{print $1"=<redacted>"}' /data/sakura/sakura-admin/docker/sakura-e
 
 ```bash
 INSTALL_ROOT='/data/sakura/sakura-admin/docker/sakura-execution-agent'
+
+# 推荐：重启并等待健康检查通过
+sudo "$INSTALL_ROOT/restart-agent.sh"
 
 # 停止
 sudo "$INSTALL_ROOT/stop-agent.sh"

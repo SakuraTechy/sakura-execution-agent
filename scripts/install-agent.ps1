@@ -289,6 +289,7 @@ if (-not [string]::Equals($knownHosts, $installedKnownHostsPath, [StringComparis
 Copy-WindowsPowerShellScript -Source (Join-Path $PSScriptRoot 'run-installed-agent.ps1') -Destination (Join-Path $installPath 'run-agent.ps1')
 Copy-WindowsPowerShellScript -Source (Join-Path $PSScriptRoot 'check-agent.ps1') -Destination (Join-Path $installPath 'check-agent.ps1')
 Copy-WindowsPowerShellScript -Source (Join-Path $PSScriptRoot 'stop-agent.ps1') -Destination (Join-Path $installPath 'stop-agent.ps1')
+Copy-WindowsPowerShellScript -Source (Join-Path $PSScriptRoot 'restart-agent.ps1') -Destination (Join-Path $installPath 'restart-agent.ps1')
 
 foreach ($profile in $Profiles) {
     $sourceProfile = Join-Path $sourceRoot "drivers\$profile"
