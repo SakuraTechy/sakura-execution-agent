@@ -3,6 +3,7 @@ package top.continew.sakura.agent.service;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
@@ -89,6 +90,55 @@ class InfrastructureTaskExecutorLocalActionTest {
     }
 
     @Test
+    void availableIpUsesHostNetworkProbeResult() throws Exception {
+        InfrastructureTaskExecutor hostProbeExecutor = executorWithProbe((prefix, start, end, timeoutMs) -> {
+            assertEquals("172.19.5", prefix);
+            assertEquals(1, start);
+            assertEquals(254, end);
+            return new AvailableIpProbe.ProbeResult("172.19.5.5", List.of("172.19.5.1", "172.19.5.2"));
+        });
+
+        InfrastructureTaskExecutor.ExecutionOutcome outcome = hostProbeExecutor.execute(request(Map.of(
+            "taskId", "available-ip", "actionType", "global_variable_available_ip", "variableName", "newIp",
+            "ipPrefix", "172.19.5.", "start", 1, "end", 254, "timeoutMs", 10000)));
+
+        assertEquals("172.19.5.5", variables(outcome).get("newIp"));
+        String log = Files.readString(tempDirectory.resolve("probe-agent.log"));
+        assertTrue(log.contains("event=AVAILABLE_IP_PROBE_STARTED"));
+        assertTrue(log.contains("arpResponders=172.19.5.1,172.19.5.2"));
+        assertTrue(log.contains("selectedIp=172.19.5.5"));
+    }
+
+    @Test
+    void availableIpFailsClosedWhenHostNetworkProbeFails() throws Exception {
+        InfrastructureTaskExecutor hostProbeExecutor = executorWithProbe((prefix, start, end, timeoutMs) -> {
+            throw new AgentExecutionException("AVAILABLE_IP_PROBE_FAILED", "宿主机探测服务不可用");
+        });
+
+        AgentExecutionException failure = assertThrows(AgentExecutionException.class,
+            () -> hostProbeExecutor.execute(request(Map.of("taskId", "available-ip-failed", "actionType",
+                "global_variable_available_ip", "variableName", "newIp", "ipPrefix", "172.19.5.",
+                "start", 1, "end", 10, "timeoutMs", 10000))));
+
+        assertEquals("AVAILABLE_IP_PROBE_FAILED", failure.errorCode());
+        assertTrue(Files.readString(tempDirectory.resolve("probe-agent.log"))
+            .contains("event=AVAILABLE_IP_PROBE_FAILED"));
+    }
+
+    @Test
+    void availableIpRejectsHostProbeResultOutsideRequestedRange() {
+        InfrastructureTaskExecutor hostProbeExecutor = executorWithProbe((prefix, start, end, timeoutMs) ->
+            new AvailableIpProbe.ProbeResult("172.19.5.2", List.of("172.19.5.2")));
+
+        AgentExecutionException failure = assertThrows(AgentExecutionException.class,
+            () -> hostProbeExecutor.execute(request(Map.of("taskId", "available-ip-range", "actionType",
+                "global_variable_available_ip", "variableName", "newIp", "ipPrefix", "172.19.5.",
+                "start", 3, "end", 10, "timeoutMs", 10000))));
+
+        assertEquals("AVAILABLE_IP_PROBE_FAILED", failure.errorCode());
+    }
+
+    @Test
     void captchaOcrRequiresNodeConfiguredCommandBeforeProcessingImage() {
         String pythonKey = "sakura.agent.captcha-ocr-python";
         String scriptKey = "sakura.agent.captcha-ocr-script";
@@ -172,6 +222,11 @@ class InfrastructureTaskExecutorLocalActionTest {
 
     private InfrastructureTaskRequest request(Map<String, Object> fields) {
         return objectMapper.convertValue(fields, InfrastructureTaskRequest.class);
+    }
+
+    private InfrastructureTaskExecutor executorWithProbe(AvailableIpProbe probe) {
+        return new InfrastructureTaskExecutor(objectMapper, tempDirectory.resolve("drivers"),
+            new AgentLogger(tempDirectory.resolve("probe-agent.log")), new LocalActionPolicy(workspace, List.of()), probe);
     }
 
     private String validatePrivateIpv4Prefix(String value) throws Exception {

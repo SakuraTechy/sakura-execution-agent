@@ -139,6 +139,10 @@ Docker 镜像内 Agent 运行目录统一为 `/app/sakura-execution-agent`；宿
 因此宿主机必须同时提供 `conf/agent-config.yml` 和经过带外核对的 `conf/known_hosts`。
 镜像内显式加载 `/app/sakura-execution-agent/conf/agent-config.yml`；修改挂载的 YAML 后需要重启 Agent 容器才能生效。
 
+Docker 部署的“获取可用 IP”由 `available-ip-probe` 宿主机网络 sidecar 执行 ARP 扫描：sidecar 仅绑定 Docker bridge 网关地址的 `19092` 端口，使用共享 Agent Token 鉴权，并且只允许扫描宿主机网卡上直连的 RFC1918 子网。Agent 通过 `SAKURA_AGENT_AVAILABLE_IP_PROBE_URL` 调用；服务不可用、目标不是直连网段或扫描失败时操作会失败，不会把探测异常当成 IP 空闲。容器探测只反映当前 ARP 可见状态，不能替代 DHCP/IPAM 地址池及静态地址登记；正式分配仍应使用网络管理员批准的地址范围。
+
+验证该步骤时，可在 Agent 日志中按 taskId 检索 `AVAILABLE_IP_PROBE_STARTED`、`AVAILABLE_IP_FOUND`、`AVAILABLE_IP_NOT_FOUND` 和 `AVAILABLE_IP_PROBE_FAILED`；成功日志包含探测来源、网段和范围、ARP 响应地址及最终选中 IP。响应地址最多记录前 64 个，超出部分会标注省略数量。Agent 自身的最终状态仍会记录为 `TASK_PASSED` 或 `TASK_FAILED`。
+
 部署前准备经过带外核对的 `known_hosts`：
 
 ```bash
@@ -151,6 +155,16 @@ sudo bash /path/to/sakura-execution-agent/scripts/install-agent.sh \
 bash start-docker.sh
 docker compose ps
 docker compose exec sakura-execution-agent curl --fail http://127.0.0.1:19091/health
+docker compose exec sakura-execution-agent curl --fail http://192.172.0.1:19092/health
+docker compose ps available-ip-probe
+docker compose logs --tail=100 available-ip-probe
+```
+
+升级已有部署时必须重建 Agent 和 sidecar 镜像，使 Java 代码和 `arp-scan` 依赖同时生效：
+
+```bash
+docker compose build --no-cache available-ip-probe sakura-execution-agent
+docker compose up -d --force-recreate available-ip-probe sakura-execution-agent continew-admin-server nginx
 ```
 
 `install-agent.sh` 负责复制或保留 YAML，并生成或复用 `sakura-execution-agent/conf/agent.env`，Compose 同时将其中的
@@ -166,6 +180,17 @@ sudo systemctl disable --now sakura-execution-agent
 
 ```bash
 SERVER_IP=172.19.5.223 bash start-docker.sh
+```
+
+`available-ip-probe` 使用宿主机网络命名空间，并绑定 Docker bridge 在宿主机上的网关地址（默认 `192.172.0.1`）。该地址不是 Agent 容器自身地址，而是宿主机 bridge 接口地址；这样 sidecar 能从宿主机的 `ens160` 路由执行 ARP 探测，同时不会监听 `172.19.5.228` 等物理网卡地址。
+
+启动后检查 sidecar 和宿主机路由：
+
+```bash
+docker compose ps available-ip-probe sakura-execution-agent
+docker compose logs --tail=100 available-ip-probe
+ip route get 172.19.5.2
+ip neigh show 172.19.5.2
 ```
 
 `docker/.env` 中的 `NGINX_HOST_PORT` 是用户访问端口，默认是 `5183`；如果该端口被占用，修改为可用端口后重新执行 `bash start-docker.sh`。

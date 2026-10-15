@@ -61,7 +61,6 @@ import java.util.Properties;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
 import top.continew.sakura.agent.support.AgentLogger;
 import top.continew.sakura.agent.support.AgentExecutionException;
 import top.continew.sakura.agent.support.LocalActionPolicy;
@@ -84,6 +83,7 @@ public class InfrastructureTaskExecutor {
     private final Path driverDirectory;
     private final AgentLogger logger;
     private final LocalActionPolicy localActionPolicy;
+    private final AvailableIpProbe availableIpProbe;
     private final Map<String, Runnable> cancelActions = new ConcurrentHashMap<>();
 
     public InfrastructureTaskExecutor(ObjectMapper objectMapper, Path driverDirectory, AgentLogger logger) {
@@ -94,10 +94,20 @@ public class InfrastructureTaskExecutor {
                                       Path driverDirectory,
                                       AgentLogger logger,
                                       LocalActionPolicy localActionPolicy) {
+        this(objectMapper, driverDirectory, logger, localActionPolicy,
+            AvailableIpProbeClient.fromEnvironment(objectMapper));
+    }
+
+    InfrastructureTaskExecutor(ObjectMapper objectMapper,
+                                Path driverDirectory,
+                                AgentLogger logger,
+                                LocalActionPolicy localActionPolicy,
+                                AvailableIpProbe availableIpProbe) {
         this.objectMapper = objectMapper;
         this.driverDirectory = driverDirectory;
         this.logger = logger;
         this.localActionPolicy = localActionPolicy;
+        this.availableIpProbe = availableIpProbe;
     }
 
     public ExecutionOutcome execute(InfrastructureTaskRequest request) throws Exception {
@@ -559,35 +569,60 @@ public class InfrastructureTaskExecutor {
         if (probeCount > maxProbeCount) {
             throw new AgentExecutionException("AVAILABLE_IP_RANGE_TOO_LARGE", "可用 IP 探测范围超过执行节点允许上限");
         }
-        AtomicBoolean cancelled = new AtomicBoolean(false);
-        cancelActions.put(request.taskId(), () -> cancelled.set(true));
-        long deadline = System.nanoTime() + Duration.ofMillis(timeoutMillis(request.timeoutMs())).toNanos();
-        int perProbeTimeout = Math.min(1_000, timeoutMillis(request.timeoutMs()));
-        try {
-            for (int hostPart = start; hostPart <= end; hostPart++) {
-                if (cancelled.get() || Thread.currentThread().isInterrupted()) {
-                    throw new AgentExecutionException("TASK_CANCELLED", "可用 IP 探测已取消");
-                }
-                long remainingMs = TimeUnit.NANOSECONDS.toMillis(deadline - System.nanoTime());
-                if (remainingMs <= 0) {
-                    throw new AgentExecutionException("AVAILABLE_IP_PROBE_TIMEOUT", "可用 IP 探测超时");
-                }
-                InetAddress candidate = InetAddress.getByName(prefix + "." + hostPart);
-                int probeTimeout = (int)Math.max(100, Math.min(perProbeTimeout, remainingMs));
-                if (!candidate.isReachable(probeTimeout)) {
-                    String availableIp = candidate.getHostAddress();
-                    logger.info("AVAILABLE_IP_FOUND", request.taskId(), request.actionType(), "probeCount=" + probeCount
-                        + " checked=" + (hostPart - start + 1));
-                    return outcome(startedAt, 0, null, null, "", "", Map.of("variables", Map.of(variableName,
-                        availableIp)));
-                }
-            }
-        } catch (AgentExecutionException exception) {
-            throw exception;
-        } catch (IOException exception) {
-            throw new AgentExecutionException("AVAILABLE_IP_PROBE_FAILED", "可用 IP 探测失败", exception);
+        if (Thread.currentThread().isInterrupted()) {
+            throw new AgentExecutionException("TASK_CANCELLED", "可用 IP 探测已取消");
         }
-        throw new AgentExecutionException("AVAILABLE_IP_NOT_FOUND", "指定范围内未找到可用 IP");
+        int probeTimeout = Math.min(30_000, timeoutMillis(request.timeoutMs()));
+        logger.info("AVAILABLE_IP_PROBE_STARTED", request.taskId(), request.actionType(), "probeSource="
+            + availableIpProbe.source() + " prefix=" + prefix + " range=" + start + "-" + end
+            + " timeoutMs=" + probeTimeout);
+        // Docker 环境的执行事实来自宿主机 ARP 探测，不能把容器内网络视角当作地址占用事实。
+        AvailableIpProbe.ProbeResult probeResult;
+        try {
+            probeResult = availableIpProbe.findAvailable(prefix, start, end, probeTimeout);
+        } catch (AgentExecutionException exception) {
+            logger.error("AVAILABLE_IP_PROBE_FAILED", request.taskId(), request.actionType(), "probeSource="
+                + availableIpProbe.source() + " prefix=" + prefix + " range=" + start + "-" + end
+                + " errorCode=" + exception.errorCode());
+            throw exception;
+        }
+        String availableIp = probeResult.availableIp();
+        if (availableIp == null) {
+            logger.warn("AVAILABLE_IP_NOT_FOUND", request.taskId(), request.actionType(), "probeSource="
+                + availableIpProbe.source() + " prefix=" + prefix + " range=" + start + "-" + end
+                + " arpResponseCount=" + probeResult.respondingIps().size() + " arpResponders="
+                + String.join(",", probeResult.respondingIps().stream().limit(64).toList()));
+            throw new AgentExecutionException("AVAILABLE_IP_NOT_FOUND", "指定范围内未找到可用 IP");
+        }
+        String[] addressParts = availableIp.split("\\.", -1);
+        if (addressParts.length != 4 || !String.join(".", addressParts[0], addressParts[1], addressParts[2]).equals(prefix)) {
+            logger.error("AVAILABLE_IP_PROBE_FAILED", request.taskId(), request.actionType(), "probeSource="
+                + availableIpProbe.source() + " reason=returned_ip_outside_prefix");
+            throw new AgentExecutionException("AVAILABLE_IP_PROBE_FAILED", "宿主机 IP 探测服务返回了范围外地址");
+        }
+        int availableHostPart;
+        try {
+            availableHostPart = Integer.parseInt(addressParts[3]);
+        } catch (NumberFormatException exception) {
+            logger.error("AVAILABLE_IP_PROBE_FAILED", request.taskId(), request.actionType(), "probeSource="
+                + availableIpProbe.source() + " reason=returned_ip_invalid");
+            throw new AgentExecutionException("AVAILABLE_IP_PROBE_FAILED", "宿主机 IP 探测服务返回了非法地址", exception);
+        }
+        if (availableHostPart < start || availableHostPart > end
+            || !availableIp.equals(prefix + "." + availableHostPart)) {
+            logger.error("AVAILABLE_IP_PROBE_FAILED", request.taskId(), request.actionType(), "probeSource="
+                + availableIpProbe.source() + " reason=returned_ip_outside_range");
+            throw new AgentExecutionException("AVAILABLE_IP_PROBE_FAILED", "宿主机 IP 探测服务返回了范围外地址");
+        }
+        List<String> respondingIps = probeResult.respondingIps();
+        String respondingIpSummary = String.join(",", respondingIps.stream().limit(64).toList());
+        int omittedResponders = Math.max(0, respondingIps.size() - 64);
+        logger.info("AVAILABLE_IP_FOUND", request.taskId(), request.actionType(), "probeSource="
+            + availableIpProbe.source() + " prefix=" + prefix + " range=" + start + "-" + end + " probeCount="
+            + probeCount + " arpResponseCount=" + respondingIps.size() + " arpResponders=" + respondingIpSummary
+            + (omittedResponders == 0 ? "" : " omittedResponders=" + omittedResponders)
+            + " selectedIp=" + availableIp);
+        return outcome(startedAt, 0, null, null, "", "", Map.of("variables", Map.of(variableName, availableIp)));
     }
 
     /**
