@@ -115,7 +115,16 @@ final class AvailableIpProbeClient implements AvailableIpProbe {
                 }
                 respondingIps.add(ip);
             }
-            return new ProbeResult((String)availableIp, respondingIps);
+            String method = result.get("probe_method") instanceof String probeMethod ? probeMethod : "arp";
+            if (!List.of("arp", "icmp").contains(method)) {
+                throw new AgentExecutionException("AVAILABLE_IP_PROBE_FAILED", "宿主机 IP 探测服务返回了无效探测方式");
+            }
+            int unknownCount = 0;
+            Object unknownCountValue = result.get("unknown_count");
+            if (unknownCountValue instanceof Number count && count.intValue() >= 0) {
+                unknownCount = count.intValue();
+            }
+            return new ProbeResult((String)availableIp, respondingIps, method, unknownCount);
         } catch (HttpTimeoutException exception) {
             throw new AgentExecutionException("AVAILABLE_IP_PROBE_TIMEOUT", "宿主机 IP 探测超时", exception);
         } catch (InterruptedException exception) {

@@ -12,9 +12,14 @@ interface AvailableIpProbe {
         return "local-reachability";
     }
 
-    record ProbeResult(String availableIp, List<String> respondingIps) {
+    record ProbeResult(String availableIp, List<String> respondingIps, String method, int unknownCount) {
         public ProbeResult {
             respondingIps = List.copyOf(respondingIps);
+            method = method == null ? "unknown" : method;
+        }
+
+        public ProbeResult(String availableIp, List<String> respondingIps) {
+            this(availableIp, respondingIps, "unknown", 0);
         }
     }
 }

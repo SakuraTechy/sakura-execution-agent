@@ -139,9 +139,9 @@ Docker 镜像内 Agent 运行目录统一为 `/app/sakura-execution-agent`；宿
 因此宿主机必须同时提供 `conf/agent-config.yml` 和经过带外核对的 `conf/known_hosts`。
 镜像内显式加载 `/app/sakura-execution-agent/conf/agent-config.yml`；修改挂载的 YAML 后需要重启 Agent 容器才能生效。
 
-Docker 部署的“获取可用 IP”由 `available-ip-probe` 宿主机网络 sidecar 执行 ARP 扫描：sidecar 仅绑定 Docker bridge 网关地址的 `19092` 端口，使用共享 Agent Token 鉴权，并且只允许扫描宿主机网卡上直连的 RFC1918 子网。Agent 通过 `SAKURA_AGENT_AVAILABLE_IP_PROBE_URL` 调用；服务不可用、目标不是直连网段或扫描失败时操作会失败，不会把探测异常当成 IP 空闲。容器探测只反映当前 ARP 可见状态，不能替代 DHCP/IPAM 地址池及静态地址登记；正式分配仍应使用网络管理员批准的地址范围。
+Docker 部署的“获取可用 IP”由 `available-ip-probe` 宿主机网络 sidecar 执行：sidecar 仅绑定 Docker bridge 网关地址的 `19092` 端口并使用共享 Agent Token 鉴权。目标为宿主机直连的 RFC1918 子网时使用 ARP；目标路由经过网关时并发执行 ICMP ping，响应地址视为占用，首个无响应地址会暂时写入可用 IP 变量。ICMP 无响应不能确认地址空闲，静默设备仍可能发生地址冲突；Agent 会记录 `AVAILABLE_IP_ICMP_CANDIDATE` 警告。此临时探测不能替代 DHCP/IPAM 地址池和静态地址登记，正式分配仍应使用网络管理员批准的地址范围。
 
-验证该步骤时，可在 Agent 日志中按 taskId 检索 `AVAILABLE_IP_PROBE_STARTED`、`AVAILABLE_IP_FOUND`、`AVAILABLE_IP_NOT_FOUND` 和 `AVAILABLE_IP_PROBE_FAILED`；成功日志包含探测来源、网段和范围、ARP 响应地址及最终选中 IP。响应地址最多记录前 64 个，超出部分会标注省略数量。Agent 自身的最终状态仍会记录为 `TASK_PASSED` 或 `TASK_FAILED`。
+验证该步骤时，可在 Agent 日志中按 taskId 检索 `AVAILABLE_IP_PROBE_STARTED`、`AVAILABLE_IP_FOUND`、`AVAILABLE_IP_ICMP_CANDIDATE`、`AVAILABLE_IP_NOT_FOUND` 和 `AVAILABLE_IP_PROBE_FAILED`；结果会注明探测方法、响应地址和最终选中 IP。响应地址最多记录前 64 个，超出部分会标注省略数量。Agent 自身的最终状态仍会记录为 `TASK_PASSED` 或 `TASK_FAILED`。
 
 部署前准备经过带外核对的 `known_hosts`：
 
@@ -160,12 +160,14 @@ docker compose ps available-ip-probe
 docker compose logs --tail=100 available-ip-probe
 ```
 
-升级已有部署时必须重建 Agent 和 sidecar 镜像，使 Java 代码和 `arp-scan` 依赖同时生效：
+升级已有部署时必须重建 Agent 和 sidecar 镜像，使 Java 代码以及 `arp-scan`、`ping` 依赖同时生效：
 
 ```bash
 docker compose build --no-cache available-ip-probe sakura-execution-agent
 docker compose up -d --force-recreate available-ip-probe sakura-execution-agent continew-admin-server nginx
 ```
+
+可用 `docker compose exec available-ip-probe ping -n -c 1 172.24.3.1` 检查 sidecar 的 ICMP 路由连通性。
 
 `install-agent.sh` 负责复制或保留 YAML，并生成或复用 `sakura-execution-agent/conf/agent.env`，Compose 同时将其中的
 `SAKURA_AGENT_TOKEN` 和 `AUTOMATION_EXECUTION_AGENT_TOKEN` 注入 Agent 与 Admin。不要再用 `openssl` 另行生成 Token，

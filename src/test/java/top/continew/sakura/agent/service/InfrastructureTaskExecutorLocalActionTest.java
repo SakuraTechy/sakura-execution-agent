@@ -105,8 +105,25 @@ class InfrastructureTaskExecutorLocalActionTest {
         assertEquals("172.19.5.5", variables(outcome).get("newIp"));
         String log = Files.readString(tempDirectory.resolve("probe-agent.log"));
         assertTrue(log.contains("event=AVAILABLE_IP_PROBE_STARTED"));
-        assertTrue(log.contains("arpResponders=172.19.5.1,172.19.5.2"));
+        assertTrue(log.contains("respondingIps=172.19.5.1,172.19.5.2"));
         assertTrue(log.contains("selectedIp=172.19.5.5"));
+    }
+
+    @Test
+    void availableIpLogsWarningForRoutedIcmpCandidate() throws Exception {
+        InfrastructureTaskExecutor icmpExecutor = executorWithProbe((prefix, start, end, timeoutMs) ->
+            new AvailableIpProbe.ProbeResult("172.24.3.1", List.of("172.24.3.2"), "icmp", 2));
+
+        InfrastructureTaskExecutor.ExecutionOutcome outcome = icmpExecutor.execute(request(Map.of(
+            "taskId", "available-ip-icmp", "actionType", "global_variable_available_ip", "variableName", "newIp",
+            "ipPrefix", "172.24.3", "start", 1, "end", 10, "timeoutMs", 10000)));
+
+        assertEquals("172.24.3.1", variables(outcome).get("newIp"));
+        String log = Files.readString(tempDirectory.resolve("probe-agent.log"));
+        assertTrue(log.contains("event=AVAILABLE_IP_ICMP_CANDIDATE"));
+        assertTrue(log.contains("unknownCount=2"));
+        assertTrue(log.contains("reason=icmp_no_response_does_not_confirm_address_is_unused"));
+        assertTrue(log.contains("probeMethod=icmp"));
     }
 
     @Test

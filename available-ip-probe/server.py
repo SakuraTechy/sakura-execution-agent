@@ -3,6 +3,7 @@ import ipaddress
 import json
 import os
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
@@ -13,14 +14,41 @@ ALLOWED_SOURCE = ipaddress.ip_network(
     os.environ.get("SAKURA_AVAILABLE_IP_PROBE_ALLOWED_SOURCE", "192.172.0.0/24"), strict=False
 )
 MAX_TIMEOUT_SECONDS = 30
+MAX_ICMP_WORKERS = 64
+ICMP_PING_TIMEOUT_SECONDS = 1
 
 
 def run_command(arguments, timeout):
     return subprocess.run(arguments, check=False, capture_output=True, text=True, timeout=timeout)
 
 
+def ping_candidate(candidate, timeout_seconds):
+    result = run_command(["ping", "-n", "-c", "1", "-W", str(ICMP_PING_TIMEOUT_SECONDS), str(candidate)],
+                         timeout_seconds)
+    if result.returncode in (0, 1):
+        return result.returncode == 0
+    raise RuntimeError("宿主机 ICMP 探测命令失败")
+
+
+def find_by_icmp(candidates, timeout_ms):
+    worker_count = min(MAX_ICMP_WORKERS, len(candidates))
+    waves = (len(candidates) + worker_count - 1) // worker_count
+    timeout_seconds = max(ICMP_PING_TIMEOUT_SECONDS + 0.5, timeout_ms / 1000 / waves)
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        futures = [executor.submit(ping_candidate, candidate, timeout_seconds) for candidate in candidates]
+        responding = [future.result() for future in futures]
+    responding_ips = [str(candidate) for candidate, is_responding in zip(candidates, responding) if is_responding]
+    return {
+        "available_ip": next((str(candidate) for candidate, is_responding in zip(candidates, responding)
+                              if not is_responding), None),
+        "responding_ips": responding_ips,
+        "probe_method": "icmp",
+        "unknown_count": len(candidates) - len(responding_ips),
+    }
+
+
 def find_available(prefix, start, end, timeout_ms):
-    # ARP 只能用于宿主机直连网段；经过网关的目标不能据此判断地址是否空闲。
+    # 直连网段用 ARP 确认占用；经网关时 ICMP 无响应仅作为临时候选。
     network_prefix = ipaddress.IPv4Network(f"{prefix}.0/24", strict=False)
     candidates = [ipaddress.IPv4Address(f"{prefix}.{host}") for host in range(start, end + 1)]
     first_octets = [int(part) for part in prefix.split(".")]
@@ -40,14 +68,25 @@ def find_available(prefix, start, end, timeout_ms):
     }
     probe_candidates = [candidate for candidate in candidates if candidate not in local_addresses]
     if not probe_candidates:
-        return {"available_ip": None, "responding_ips": []}
+        return {"available_ip": None, "responding_ips": [], "probe_method": "arp", "unknown_count": 0}
 
-    route = run_command(["ip", "-j", "route", "get", str(probe_candidates[0])], 1)
-    if route.returncode != 0:
-        raise RuntimeError("无法查询目标路由")
-    routes = json.loads(route.stdout)
-    if len(routes) != 1 or routes[0].get("gateway") or not routes[0].get("dev"):
-        raise RuntimeError("目标 IP 不属于宿主机直连网络")
+    def get_route(candidate):
+        route = run_command(["ip", "-j", "route", "get", str(candidate)], 1)
+        if route.returncode != 0:
+            raise RuntimeError("无法查询目标路由")
+        routes = json.loads(route.stdout)
+        if len(routes) != 1 or not routes[0].get("dev"):
+            raise RuntimeError("无法确定目标网络路由")
+        return routes[0]
+
+    route_workers = min(MAX_ICMP_WORKERS, len(probe_candidates))
+    with ThreadPoolExecutor(max_workers=route_workers) as executor:
+        routes = list(executor.map(get_route, probe_candidates))
+    route_profiles = {(route["dev"], route.get("gateway")) for route in routes}
+    if len(route_profiles) != 1:
+        raise RuntimeError("探测范围跨越不同网络路由，请拆分探测范围")
+    if routes[0].get("gateway"):
+        return find_by_icmp(probe_candidates, timeout_ms)
 
     interface = routes[0]["dev"]
     target_network = None
@@ -63,7 +102,8 @@ def find_available(prefix, start, end, timeout_ms):
                 break
     if target_network is None or not network_prefix.subnet_of(target_network):
         raise RuntimeError("目标 IP 不属于宿主机网卡所在子网或为保留地址")
-    if any(candidate in (target_network.network_address, target_network.broadcast_address) for candidate in candidates):
+    if any(candidate in (target_network.network_address, target_network.broadcast_address)
+           for candidate in probe_candidates):
         raise RuntimeError("候选范围包含网络地址或广播地址")
 
     timeout_seconds = max(1, min(MAX_TIMEOUT_SECONDS, (timeout_ms + 999) // 1000))
@@ -83,7 +123,12 @@ def find_available(prefix, start, end, timeout_ms):
     responding_ips = [str(candidate) for candidate in candidates if candidate in active_addresses]
     available_ip = next((str(candidate) for candidate in candidates
                          if candidate not in active_addresses and candidate not in local_addresses), None)
-    return {"available_ip": available_ip, "responding_ips": responding_ips}
+    return {
+        "available_ip": available_ip,
+        "responding_ips": responding_ips,
+        "probe_method": "arp",
+        "unknown_count": 0,
+    }
 
 
 class ProbeHandler(BaseHTTPRequestHandler):

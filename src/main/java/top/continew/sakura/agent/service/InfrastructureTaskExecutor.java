@@ -576,7 +576,7 @@ public class InfrastructureTaskExecutor {
         logger.info("AVAILABLE_IP_PROBE_STARTED", request.taskId(), request.actionType(), "probeSource="
             + availableIpProbe.source() + " prefix=" + prefix + " range=" + start + "-" + end
             + " timeoutMs=" + probeTimeout);
-        // Docker 环境的执行事实来自宿主机 ARP 探测，不能把容器内网络视角当作地址占用事实。
+        // Docker 环境从宿主机网络命名空间探测；经网关时 ICMP 无响应只能作为临时候选。
         AvailableIpProbe.ProbeResult probeResult;
         try {
             probeResult = availableIpProbe.findAvailable(prefix, start, end, probeTimeout);
@@ -617,9 +617,15 @@ public class InfrastructureTaskExecutor {
         List<String> respondingIps = probeResult.respondingIps();
         String respondingIpSummary = String.join(",", respondingIps.stream().limit(64).toList());
         int omittedResponders = Math.max(0, respondingIps.size() - 64);
+        if ("icmp".equals(probeResult.method())) {
+            logger.warn("AVAILABLE_IP_ICMP_CANDIDATE", request.taskId(), request.actionType(), "selectedIp="
+                + availableIp + " unknownCount=" + probeResult.unknownCount()
+                + " reason=icmp_no_response_does_not_confirm_address_is_unused");
+        }
         logger.info("AVAILABLE_IP_FOUND", request.taskId(), request.actionType(), "probeSource="
-            + availableIpProbe.source() + " prefix=" + prefix + " range=" + start + "-" + end + " probeCount="
-            + probeCount + " arpResponseCount=" + respondingIps.size() + " arpResponders=" + respondingIpSummary
+            + availableIpProbe.source() + " probeMethod=" + probeResult.method() + " prefix=" + prefix
+            + " range=" + start + "-" + end + " probeCount=" + probeCount + " respondingCount="
+            + respondingIps.size() + " respondingIps=" + respondingIpSummary
             + (omittedResponders == 0 ? "" : " omittedResponders=" + omittedResponders)
             + " selectedIp=" + availableIp);
         return outcome(startedAt, 0, null, null, "", "", Map.of("variables", Map.of(variableName, availableIp)));
